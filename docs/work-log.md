@@ -503,3 +503,30 @@ Entries are appended as work lands; every claim points at a gate or a file.
   engine synthesizer checks. Both signed packages in
   out/compact-input-20261126 contain the same host binary and reuse their
   respective 0.2.4.25 certificates. No console deployment was performed.
+
+### 2026-11-26 — Integration since the latest public release
+
+- GitHub lists `v0.2.4.12` as the latest published release, with publication
+  at 2026-11-24 11:56:58 UTC and source commit `7b28b5f`.
+  `integration/xbox-post-v0.2.4.12` tracks the work since that point.
+- The branch uses the 0.2.4.42 source capture and the later live-source merge
+  at `9927639`. It carries forward the console profiles, shell and input
+  changes, storage and Steam workflows, managed guest work, and shared
+  runtime fixes from those captures.
+- `32e202c` restores the November 24 module-path regression.
+  `c424b99` carries forward the bounded guest exception dispatch exercised
+  in the November 24 diagnostic. The diagnostic reproduced a different
+  access violation after avoiding the previous recursive stack overflow.
+  Xbox gameplay remains unverified for this build.
+- The November 23 dashboard export and older engine experiments are
+  preserved on `integration/xbox-0.2.4.42-resume` at `abebe74` and the
+  original agent refs. Their recovery dates are later than their original
+  source dates.
+- The full Linux gate, version-resource fixture, FNA rebuild, and unsigned
+  UWP cross-build passed. All 123 game binaries matched the broader
+  branch's load-only results. Verification logs and the UWP binary hash are
+  under `.git/verification/xbox-post-v0.2.4.12`.
+- During verification, two generated Linux libraries in the main checkout
+  were refreshed. Both match the previous verified libraries byte for
+  byte. The final run used dependency outputs in the scratch worktree.
+  All 184 live source files checked matched the saved live snapshot.
