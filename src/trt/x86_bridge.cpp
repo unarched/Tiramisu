@@ -615,6 +615,11 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"winmm","waveOutPause",1},{"winmm","waveOutRestart",1},
         {"winmm","waveOutBreakLoop",1},{"winmm","waveOutMessage",4},
         {"winmm","waveOutGetErrorTextW",3},{"winmm","waveOutGetErrorTextA",3},
+        {"winmm","joyGetNumDevs",0},{"winmm","joyGetPos",2},
+        {"winmm","joyGetPosEx",2},{"winmm","joyGetDevCapsA",3},
+        {"winmm","joyGetDevCapsW",3},{"winmm","joyGetThreshold",2},
+        {"winmm","joySetThreshold",2},{"winmm","joySetCapture",4},
+        {"winmm","joyReleaseCapture",1},{"winmm","joyConfigChanged",1},
         // msacm32 decodes for real now, so the 32-bit dispatcher must know
         // every one of its arities instead of guessing four arguments.
         {"msacm32","acmGetVersion",0},{"msacm32","acmStreamOpen",8},

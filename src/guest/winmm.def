@@ -19,7 +19,15 @@ EXPORTS
     midiOutGetVolume
     midiOutSetVolume
     joyGetNumDevs
+    joyGetPos
     joyGetPosEx
+    joyGetDevCapsA
+    joyGetDevCapsW
+    joyGetThreshold
+    joySetThreshold
+    joySetCapture
+    joyReleaseCapture
+    joyConfigChanged
     mciSendStringW
     GetProfileStringW
     PlaySoundW

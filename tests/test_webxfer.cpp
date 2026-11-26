@@ -177,6 +177,19 @@ int main() {
               r3.find("400 Bad Request") != std::string::npos &&
               r4.find("400 Bad Request") != std::string::npos,
           "All path traversal attempts rejected with 400 Bad Request");
+
+    // Issue #1 regression: legitimate folder/file names containing '..' inside a
+    // component (not traversal) and 0-byte folder files must still upload cleanly.
+    std::string r_dots = http_req(
+        port, "PUT", "/api/upload-file?game=Game..v1&rel=sub..dir/empty..bin&batch=1", "");
+    std::string r_done = http_req(port, "POST", "/api/upload-complete?game=Game..v1", "");
+    CHECK(r_dots.find("200 OK") != std::string::npos &&
+              r_done.find("200 OK") != std::string::npos &&
+              read_str_file(root + "/games/Game..v1/sub..dir/empty..bin").empty(),
+          "Folder upload accepts non-traversal '..' names, 0-byte files, and upload-complete");
+    std::string rescan_game;
+    CHECK(longan::webxfer_poll_rescan(&rescan_game) && rescan_game == "Game..v1",
+          "/api/upload-complete triggers scoped host rescan");
   }
 
   // 5. Unpacked folder streaming upload

@@ -611,7 +611,6 @@ bool valid_path_component(const std::string& name) {
 bool sanitize_game_name(const std::string& raw, std::string* out) {
   std::string s = trim_ws(raw);
   if (s.empty() || s.size() > 160 || s == "." || s == "..") return false;
-  if (s.find("..") != std::string::npos) return false;
   if (!valid_path_component(s)) return false;
   *out = s;
   return true;
@@ -624,7 +623,7 @@ bool sanitize_rel_path(const std::string& raw, char sep, std::string* out) {
   for (size_t i = 0; i <= raw.size(); ++i) {
     if (i == raw.size() || raw[i] == '/' || raw[i] == '\\') {
       if (!cur.empty()) {
-        if (cur == "." || cur == ".." || cur.find("..") != std::string::npos) {
+        if (cur == "." || cur == "..") {
           return false;
         }
         if (!valid_path_component(cur)) return false;
@@ -1436,7 +1435,7 @@ const char* k_upload_page =
   "async function uploadFiles(items,forcedRoot){"
   "if(!items.length)return;"
   "let g=(E('gname').value||'').trim();"
-  "if(!g){g=forcedRoot||(items[0].rel.split('/')[0]||'UploadedGame');g=g.replace(/\\.zip$/i,'');E('gname').value=g;}"
+  "if(!g){const r0=items[0].rel||'';g=forcedRoot||(r0.includes('/')?r0.split('/')[0]:'UploadedGame');g=g.replace(/\\.zip$/i,'');E('gname').value=g;}"
   "let total=0,done=0,count=0;const inflight=new Map();const t0=Date.now();items.forEach(x=>total+=x.file.size);"
   "const paint=()=>{let curBytes=done;inflight.forEach(v=>curBytes+=v);"
   "const sec=Math.max(0.2,(Date.now()-t0)/1000);const mbps=(curBytes/1048576)/sec;"
@@ -1450,6 +1449,7 @@ const char* k_upload_page =
   "let rel=safeRel(cur.rel);const p0=rel.indexOf('/');"
   "if(!forcedRoot&&p0>0&&rel.slice(0,p0)===g)rel=rel.slice(p0+1);"
   "if(cur.stripFirst&&rel.includes('/'))rel=rel.slice(rel.indexOf('/')+1);"
+  "if(!rel)continue;"
   "const url='/api/upload-file?game='+encodeURIComponent(g)+'&rel='+encodeURIComponent(rel)+'&batch=1';"
   "await putWithRetry(url,cur.file,(ld)=>{inflight.set(myId,ld);paint();});"
   "inflight.delete(myId);done+=cur.file.size;count++;paint();}}"
@@ -1471,34 +1471,42 @@ const char* k_upload_page =
   "try{const r=await fetch('/api/download-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,game:g})});"
   "setLog(await r.text());if(r.ok)hadDownload=true;else E('fill').style.width='0%';}"
   "catch(e){E('fill').style.width='0%';setLog('Could not reach Xbox: '+e.message);}}"
-  "function openDirPicker(){"
+  "async function walkDirHandle(dh,prefix,out){for await(const [nm,h] of dh.entries()){"
+  "if(h.kind==='file'){out.push({file:await h.getFile(),rel:prefix+nm,stripFirst:false});}"
+  "else if(h.kind==='directory'){await walkDirHandle(h,prefix+nm+'/',out);}}}"
+  "async function openDirPicker(){"
   "const inp=E('fdir');"
-  "const ios=/iPhone|iPad|iPod/i.test(navigator.userAgent);"
-  "if(ios||!('webkitdirectory' in inp)){"
+  "const hasWd=('webkitdirectory' in inp)||('directory' in inp);"
+  "if(!hasWd&&typeof window.showDirectoryPicker==='function'){"
+  "try{const dh=await window.showDirectoryPicker();const out=[];await walkDirHandle(dh,'',out);"
+  "if(!out.length){setLog('Selected folder is empty.');return;}"
+  "return uploadFiles(out,dh.name);}catch(e){if(e&&e.name==='AbortError')return;}}"
+  "if(!hasWd){"
   "setLog('Folder upload is not supported in this browser — compress the game folder as a .zip and tap Upload .zip, or use Pick Files (Phone).');"
   "E('dirhint').style.color='#f3dbc4';return;}"
-  "if(/Android|Mobile/i.test(navigator.userAgent)||(navigator.userAgentData&&navigator.userAgentData.mobile)){"
-  "setLog('Opening the mobile folder picker. If it selects no files, use Upload .zip or Pick Files (Phone) instead.');}"
+  "if(/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)||(navigator.userAgentData&&navigator.userAgentData.mobile)){"
+  "setLog('Opening folder picker. If your browser blocks folders, use Upload .zip or Pick Files (Phone).');}"
   "inp.click();}"
   "if(/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)||(navigator.userAgentData&&navigator.userAgentData.mobile)){"
   "E('dirhint').innerHTML='Mobile browser detected: folder upload may be blocked — <b>Upload .zip</b> or <b>Pick Files (Phone)</b> is the reliable path. Large games: use an Xbox USB drive.';"
   "E('dirhint').style.color='#f3dbc4';}"
-  "E('fzip').onchange=e=>{if(e.target.files[0])uploadZip(e.target.files[0]);e.target.value='';};"
-  "E('fdir').onchange=e=>{const fs=[...e.target.files];if(!fs.length){"
-  "setLog('No files found in selected folder — zip the folder and use Upload .zip instead.');return;}"
-  "const root=(fs[0].webkitRelativePath||fs[0].name).split('/')[0];"
-  "uploadFiles(fs.map(f=>({file:f,rel:f.webkitRelativePath||f.name,stripFirst:true})),root);e.target.value='';};"
-  "E('ffiles').onchange=e=>{const fs=[...e.target.files];if(!fs.length)return;"
-  "if(fs.length===1&&/\\.zip$/i.test(fs[0].name)){uploadZip(fs[0]);}else{"
-  "uploadFiles(fs.map(f=>({file:f,rel:f.name,stripFirst:false})),'');}e.target.value='';};"
+  "E('fzip').onchange=async e=>{const f=e.target.files[0];if(f)await uploadZip(f);e.target.value='';};"
+  "E('fdir').onchange=async e=>{const fs=[...e.target.files];if(!fs.length){"
+  "setLog('No files found in selected folder — zip the folder and use Upload .zip instead.');e.target.value='';return;}"
+  "const rel0=safeRel(fs[0].webkitRelativePath||'');"
+  "const root=rel0.includes('/')?rel0.split('/')[0]:'';"
+  "try{await uploadFiles(fs.map(f=>({file:f,rel:f.webkitRelativePath||f.name,stripFirst:Boolean(root)})),root);}finally{e.target.value='';}};"
+  "E('ffiles').onchange=async e=>{const fs=[...e.target.files];if(!fs.length)return;"
+  "try{if(fs.length===1&&/\\.zip$/i.test(fs[0].name)){await uploadZip(fs[0]);}else{"
+  "await uploadFiles(fs.map(f=>({file:f,rel:f.name,stripFirst:false})),'');}}finally{e.target.value='';}};"
   "E('frestore').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;"
   "E('supstat').textContent='Restoring saves from '+f.name+'...';"
   "try{const r=await putWithRetry('/api/restore-saves',f);E('supstat').textContent='Restore complete: '+r.text;loadSettings();}catch(err){E('supstat').textContent='Restore failed: '+err.message;}};"
-  "async function walkEntry(ent,prefix,out){if(ent.isFile){"
-  "const f=await new Promise(res=>ent.file(res));out.push({file:f,rel:prefix+f.name,stripFirst:false});"
+  "async function walkEntry(ent,prefix,stripTop,out){if(ent.isFile){"
+  "const f=await new Promise(res=>ent.file(res));out.push({file:f,rel:prefix+f.name,stripFirst:stripTop});"
   "}else if(ent.isDirectory){const rdr=ent.createReader();"
   "const all=[];while(true){const b=await new Promise(res=>rdr.readEntries(res));if(!b.length)break;all.push(...b);}"
-  "for(const c of all)await walkEntry(c,prefix+ent.name+'/',out);}}"
+  "for(const c of all)await walkEntry(c,prefix+ent.name+'/',stripTop,out);}}"
   "const dz=E('dz');"
   "dz.ondragover=e=>{e.preventDefault();dz.classList.add('over');};"
   "dz.ondragleave=()=>dz.classList.remove('over');"
@@ -1506,8 +1514,11 @@ const char* k_upload_page =
   "const items=[...(e.dataTransfer.items||[])];"
   "const ents=items.map(i=>i.webkitGetAsEntry?i.webkitGetAsEntry():null).filter(Boolean);"
   "if(ents.length===1&&ents[0].isFile&&/\\.zip$/i.test(ents[0].name)){const f=await new Promise(r=>ents[0].file(r));return uploadZip(f);}"
-  "if(ents.length){const out=[];for(const en of ents)await walkEntry(en,'',out);"
-  "const root=ents[0].isDirectory?ents[0].name:'';await uploadFiles(out.map(x=>({...x,stripFirst:ents[0].isDirectory})),root);}"
+  "if(ents.length){const out=[];const dirs=ents.filter(en=>en.isDirectory);"
+  "const singleDir=(ents.length===1&&dirs.length===1);"
+  "for(const en of ents)await walkEntry(en,'',singleDir&&en.isDirectory,out);"
+  "const root=singleDir?dirs[0].name:(dirs.length===1&&out.length?dirs[0].name:'');"
+  "await uploadFiles(out,root);}"
   "else if(e.dataTransfer.files.length){const f=e.dataTransfer.files[0];if(/\\.zip$/i.test(f.name))uploadZip(f);else uploadFiles([...e.dataTransfer.files].map(x=>({file:x,rel:x.name,stripFirst:false})),'');}};"
   "async function uploadCover(name,inp){const f=inp.files[0];if(!f)return;"
   "setLog('Uploading cover art for '+name+'...');"

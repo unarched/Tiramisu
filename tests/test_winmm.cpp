@@ -148,6 +148,54 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x10u, "timeGetDevCaps sane");
   CHECK(ret & 0x20u, "mciSendStringW fails visibly (263)");
 
+  // Issue #6 regression: joyGetPos and the WinMM joystick API must resolve
+  // cleanly for games like The Spike Cross on both winmm.dll and winmmbase.dll.
+  {
+    void* p_num = rs.resolve(rs.user, "winmm.dll", "joyGetNumDevs", 0);
+    void* p_pos = rs.resolve(rs.user, "winmm.dll", "joyGetPos", 0);
+    void* p_base_pos = rs.resolve(rs.user, "winmmbase.dll", "joyGetPos", 0);
+    void* p_posex = rs.resolve(rs.user, "winmm.dll", "joyGetPosEx", 0);
+    void* p_caps_a = rs.resolve(rs.user, "winmm.dll", "joyGetDevCapsA", 0);
+    void* p_caps_w = rs.resolve(rs.user, "winmm.dll", "joyGetDevCapsW", 0);
+    void* p_gth = rs.resolve(rs.user, "winmm.dll", "joyGetThreshold", 0);
+    void* p_sth = rs.resolve(rs.user, "winmm.dll", "joySetThreshold", 0);
+    void* p_scap = rs.resolve(rs.user, "winmm.dll", "joySetCapture", 0);
+    void* p_rcap = rs.resolve(rs.user, "winmm.dll", "joyReleaseCapture", 0);
+    void* p_cfg = rs.resolve(rs.user, "winmm.dll", "joyConfigChanged", 0);
+    CHECK(p_num != nullptr, "winmm.dll!joyGetNumDevs resolves");
+    CHECK(p_pos != nullptr, "winmm.dll!joyGetPos resolves");
+    CHECK(p_base_pos == p_pos && p_base_pos != nullptr,
+          "winmmbase.dll!joyGetPos resolves");
+    CHECK(p_posex != nullptr, "winmm.dll!joyGetPosEx resolves");
+    CHECK(p_caps_a != nullptr, "winmm.dll!joyGetDevCapsA resolves");
+    CHECK(p_caps_w != nullptr, "winmm.dll!joyGetDevCapsW resolves");
+    CHECK(p_gth != nullptr, "winmm.dll!joyGetThreshold resolves");
+    CHECK(p_sth != nullptr, "winmm.dll!joySetThreshold resolves");
+    CHECK(p_scap != nullptr, "winmm.dll!joySetCapture resolves");
+    CHECK(p_rcap != nullptr, "winmm.dll!joyReleaseCapture resolves");
+    CHECK(p_cfg != nullptr, "winmm.dll!joyConfigChanged resolves");
+
+    u32 joyinfo[4] = {0xAAAAAAAAu, 0xBBBBBBBBu, 0xCCCCCCCCu, 0xDDDDDDDDu};
+    const u64 pos_rc = p_pos ? win64_call(p_pos, 0, (u64)(uintptr_t)joyinfo, 0) : 0;
+    CHECK(pos_rc == 167 && joyinfo[0] == 0 && joyinfo[1] == 0 && joyinfo[2] == 0 && joyinfo[3] == 0,
+          "joyGetPos zeroes JOYINFO and returns JOYERR_UNPLUGGED (167)");
+    const u64 pos_null = p_pos ? win64_call(p_pos, 0, 0, 0) : 0;
+    CHECK(pos_null == 11, "joyGetPos(NULL) returns MMSYSERR_INVALPARAM (11)");
+
+    u32 thresh = 999;
+    const u64 gth_rc = p_gth ? win64_call(p_gth, 0, (u64)(uintptr_t)&thresh, 0) : 0;
+    CHECK(gth_rc == 167 && thresh == 0, "joyGetThreshold returns JOYERR_UNPLUGGED and clears threshold");
+
+    u8 caps[64];
+    memset(caps, 0x5A, sizeof(caps));
+    const u64 cap_rc = p_caps_w ? win64_call(p_caps_w, 0, (u64)(uintptr_t)caps, sizeof(caps)) : 0;
+    CHECK(cap_rc == 165 && caps[0] == 0 && caps[63] == 0,
+          "joyGetDevCapsW zeroes caps buffer and returns JOYERR_PARMS (165)");
+
+    const u64 cfg_rc = p_cfg ? win64_call(p_cfg, 0, 0, 0) : 999;
+    CHECK(cfg_rc == 0, "joyConfigChanged returns JOYERR_NOERROR (0)");
+  }
+
   free(file);
   if (failures == 0) {
     printf("RESULT: ALL PASS\n");
