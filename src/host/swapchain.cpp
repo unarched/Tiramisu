@@ -953,6 +953,15 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
     log_line("graphics: retrying D3D11 with feature levels 11_0 and lower");
     r.device_hr = create_device(levels + 1, static_cast<UINT>(level_count - 1));
   }
+  if (FAILED(r.device_hr)) {
+    log_line("graphics: hardware D3D11CreateDevice failed; retrying WARP adapter");
+    dev = nullptr;
+    ctx = nullptr;
+    r.device_hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                                    flags, levels, static_cast<UINT>(level_count),
+                                    D3D11_SDK_VERSION, dev.put(), &achieved,
+                                    ctx.put());
+  }
   if (FAILED(r.device_hr)) return r;
   g_fl = (unsigned)achieved;
   r.feature_level = g_fl;

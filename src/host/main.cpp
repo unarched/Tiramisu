@@ -3203,11 +3203,17 @@ struct tiramisu_host
   }
 
   void trigger_steam_item_action(unsigned app_id) {
-    if (!app_id) return;
+    if (!app_id) {
+      longan::ui_toast(L"Select a Steam title first", 2.5f);
+      return;
+    }
     const auto items = longan::steam_client_items();
     const auto found = std::find_if(items.begin(), items.end(),
         [app_id](const auto& item) { return item.app_id == app_id; });
-    if (found == items.end()) return;
+    if (found == items.end()) {
+      longan::ui_toast(L"Selected Steam title is no longer in the list", 2.5f);
+      return;
+    }
     const auto& it = *found;
     if (it.downloading || it.queued) {
       if (longan::steam_client_cancel_download(app_id))
@@ -3231,10 +3237,27 @@ struct tiramisu_host
         game = std::find_if(g_games.begin(), g_games.end(), matches_install);
       }
       if (game == g_games.end()) {
-        longan::ui_toast(L"Steam install could not be added to the game library", 4.0f);
-        return;
+        rescan_games();
+        game = std::find_if(g_games.begin(), g_games.end(), matches_install);
       }
-      g_pending_launch = {game->name, game->dir, install.executable};
+      std::string launch_name = it.title;
+      if (game != g_games.end()) {
+        launch_name = game->name;
+      } else {
+        game_entry direct;
+        const size_t sl = it.install_dir.find_last_of("\\/");
+        direct.name = !it.title.empty() ? it.title
+                      : (sl == std::string::npos ? it.install_dir : it.install_dir.substr(sl + 1));
+        direct.dir = it.install_dir;
+        direct.exe = install.executable;
+        direct.exes.push_back(install.executable);
+        direct.input_mode = "auto";
+        g_games.push_back(std::move(direct));
+        launch_name = g_games.back().name;
+      }
+      g_pending_launch = {launch_name, it.install_dir, install.executable};
+      longan::ui_sfx_launch();
+      longan::ui_toast(L"Launching " + u82ws(launch_name) + L"…", 3.0f);
     } else if (!it.downloading) {
       if (!longan::steam_client_account().signed_in) {
         longan::ui_toast(L"Sign in with Steam to install this game", 3.0f);
@@ -3534,16 +3557,6 @@ struct tiramisu_host
     };
     const wchar_t* graphics_step = SUCCEEDED(m_graphics_status)
         ? L"Direct3D 11 ready" : L"Display unavailable; check LAN dashboard logs";
-    setup_steps({L"Storage ready", graphics_step}, L"Probing gamepads…", false);
-    run_probes();
-    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed"},
-                L"Starting audio output…", false);
-    longan::audio_init();
-    longan::audio_status(line, sizeof(line));
-    longan::log_line(line);
-    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
-                 std::wstring(L"Audio: ") + u82ws(line)},
-                L"Starting the transfer server…", false);
     longan::webxfer_set_package_games_dir(g_package_games_dir);
     const std::string url = longan::webxfer_start(g_local_state, 1920);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
@@ -3552,6 +3565,16 @@ struct tiramisu_host
     const auto code = longan::webxfer_control_code();
     if (!url.empty() && !code.empty()) g_control_code_cached = code;
     refresh_control_hint();
+    setup_steps({L"Storage ready", graphics_step}, L"Probing gamepads…", false);
+    run_probes();
+    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed"},
+                L"Starting audio output…", false);
+    longan::audio_init();
+    longan::audio_status(line, sizeof(line));
+    longan::log_line(line);
+    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed",
+                 std::wstring(L"Audio: ") + u82ws(line)},
+                L"Starting the transfer server…", false);
     namespace wdi = winrt::Windows::Devices::Input;
     int keyboard = -1, mouse = -1;
     try { keyboard = wdi::KeyboardCapabilities().KeyboardPresent(); } catch (...) {}
@@ -3855,7 +3878,8 @@ struct tiramisu_host
                 const float rx = pos.X - bnd.X;
                 const float ry = pos.Y - bnd.Y;
                 if (!relative_active && !core_pointer_recent && last_cw_x > -9000.0f &&
-                    (fabsf(rx - last_cw_x) > 0.5f || fabsf(ry - last_cw_y) > 0.5f)) {
+                    (fabsf(rx - last_cw_x) > (pad_ok ? 3.0f : 0.5f) ||
+                     fabsf(ry - last_cw_y) > (pad_ok ? 3.0f : 0.5f))) {
                   int dw = 1920, dh = 1080;
                   trt_display_size(&dw, &dh);
                   const int cx = std::clamp((int)(rx * dw / bnd.Width), 0, dw - 1);

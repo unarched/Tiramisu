@@ -249,7 +249,63 @@ u32 TRT_GUEST_ABI trt_waveOutGetDevCapsA(u64 dev, void* caps, u32 size) {
 
 u32 TRT_GUEST_ABI trt_joyGetNumDevs(void) { return 0; }
 
-u32 TRT_GUEST_ABI trt_joyGetPosEx(u32, void*) { return 167 /* JOYERR_UNPLUGGED */; }
+u32 TRT_GUEST_ABI trt_joyGetPos(u32 uJoyID, void* pji) {
+  (void)uJoyID;
+  if (!pji) return 11 /* MMSYSERR_INVALPARAM */;
+  memset(pji, 0, 16);  // JOYINFO: wXpos, wYpos, wZpos, wButtons (4 x UINT)
+  return 167 /* JOYERR_UNPLUGGED */;
+}
+
+u32 TRT_GUEST_ABI trt_joyGetPosEx(u32 uJoyID, void* pji) {
+  (void)uJoyID;
+  if (!pji) return 11 /* MMSYSERR_INVALPARAM */;
+  return 167 /* JOYERR_UNPLUGGED */;
+}
+
+u32 TRT_GUEST_ABI trt_joyGetDevCapsA(u64 uJoyID, void* pjc, u32 cbjc) {
+  (void)uJoyID;
+  if (!pjc || cbjc == 0) return 11 /* MMSYSERR_INVALPARAM */;
+  memset(pjc, 0, cbjc);
+  return 165 /* JOYERR_PARMS */;
+}
+
+u32 TRT_GUEST_ABI trt_joyGetDevCapsW(u64 uJoyID, void* pjc, u32 cbjc) {
+  (void)uJoyID;
+  if (!pjc || cbjc == 0) return 11 /* MMSYSERR_INVALPARAM */;
+  memset(pjc, 0, cbjc);
+  return 165 /* JOYERR_PARMS */;
+}
+
+u32 TRT_GUEST_ABI trt_joyGetThreshold(u32 uJoyID, u32* puThreshold) {
+  (void)uJoyID;
+  if (!puThreshold) return 11 /* MMSYSERR_INVALPARAM */;
+  *puThreshold = 0;
+  return 167 /* JOYERR_UNPLUGGED */;
+}
+
+u32 TRT_GUEST_ABI trt_joySetThreshold(u32 uJoyID, u32 uThreshold) {
+  (void)uJoyID;
+  (void)uThreshold;
+  return 167 /* JOYERR_UNPLUGGED */;
+}
+
+u32 TRT_GUEST_ABI trt_joySetCapture(void* hwnd, u32 uJoyID, u32 uPeriod, u32 fChanged) {
+  (void)hwnd;
+  (void)uJoyID;
+  (void)uPeriod;
+  (void)fChanged;
+  return 167 /* JOYERR_UNPLUGGED */;
+}
+
+u32 TRT_GUEST_ABI trt_joyReleaseCapture(u32 uJoyID) {
+  (void)uJoyID;
+  return 167 /* JOYERR_UNPLUGGED */;
+}
+
+u32 TRT_GUEST_ABI trt_joyConfigChanged(u32 dwFlags) {
+  (void)dwFlags;
+  return 0 /* JOYERR_NOERROR */;
+}
 
 // ---- mciSendStringW: engines probe codecs with it; answer "cannot find
 // the device" (MCIERR_INVALID_DEVICE_NAME = 263) visibly rather than crash ----
@@ -895,7 +951,15 @@ int trt_bridge_register_winmm(void) {
       {"midiInGetDevCapsW", (void*)&trt_midiInGetDevCapsA},
       {"midiInGetErrorTextA", (void*)&trt_midiInGetErrorTextA},
       {"joyGetNumDevs", (void*)&trt_joyGetNumDevs},
+      {"joyGetPos", (void*)&trt_joyGetPos},
       {"joyGetPosEx", (void*)&trt_joyGetPosEx},
+      {"joyGetDevCapsA", (void*)&trt_joyGetDevCapsA},
+      {"joyGetDevCapsW", (void*)&trt_joyGetDevCapsW},
+      {"joyGetThreshold", (void*)&trt_joyGetThreshold},
+      {"joySetThreshold", (void*)&trt_joySetThreshold},
+      {"joySetCapture", (void*)&trt_joySetCapture},
+      {"joyReleaseCapture", (void*)&trt_joyReleaseCapture},
+      {"joyConfigChanged", (void*)&trt_joyConfigChanged},
       {"mciSendStringW", (void*)&trt_mciSendStringW},
       {"mciSendCommandA", (void*)&trt_mciSendCommandA},
       {"mciSendCommandW", (void*)&trt_mciSendCommandW},

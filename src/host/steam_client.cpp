@@ -2585,7 +2585,9 @@ static void start_steam_download(uint32_t app_id, std::function<void()> on_compl
       bool committed;
       {
         std::lock_guard<std::mutex> lock(g_mu);
-        committed = !g_cancel_download && DeleteFileA(pending_path.c_str()) != 0;
+        committed = !g_cancel_download &&
+                    (DeleteFileA(pending_path.c_str()) != 0 ||
+                     GetLastError() == ERROR_FILE_NOT_FOUND);
         g_install_committed = committed;
       }
       if (!committed) return fail("could not finalize the Steam install");
