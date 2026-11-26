@@ -279,7 +279,7 @@ inline void hk_clear(u32 mask, const float rgba[4], float depth, int stencil, vo
 
 inline void hk_swap_buffers(u64, void*) {
   if (!g_glrt.initialized || !g_glrt.swap) return;
-  longan::draw_pointer(false);
+  longan::draw_guest_pointer();
   g_glrt.swap->Present(1, 0);
 }
 

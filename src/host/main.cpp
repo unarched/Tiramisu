@@ -8,6 +8,8 @@
 #include "host_log.h"
 #include "audio.h"
 #include "boot_anim.h"
+#include "cursor_policy.h"
+#include "input_policy.h"
 #include "swapchain.h"
 #include "ui.h"
 #include "ui_sfx.h"
@@ -88,6 +90,7 @@ extern "C" void* __stdcall AddVectoredExceptionHandler(
     LONG (WINAPI *Handler)(EXCEPTION_POINTERS*));
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -138,11 +141,7 @@ std::string g_pending_launch;
 static longan::host_autopilot_state& g_host_ap = longan::host_ap_state();
 bool g_mouse_mode = false;
 bool g_kbd_mouse_mode = false;
-// Set only when pad-as-mouse was chosen automatically because no pointer was
-// visible at boot. A mouse connected later clears it so the real device takes
-// over the cursor immediately (the mouse allowlist is present in our package
-// identity, but the shell may attach the device after launch).
-std::atomic<bool> g_auto_pad_mouse{false};
+longan::guest_input_mode g_guest_input_mode = longan::guest_input_mode::automatic;
 bool g_quick_menu_open = false;
 std::string g_control_code_cached;
 std::atomic<bool> g_f8_down{false};
@@ -158,6 +157,7 @@ bool g_setup_active = false;    // currently showing the setup screen
 std::atomic<bool> g_controller_active{true};
 std::atomic<ULONGLONG> g_last_mouse_move_ms{0};
 std::atomic<ULONGLONG> g_last_raw_mouse_ms{0};
+std::atomic<bool> g_physical_pointer_seen{false};
 // Last CoreWindow-derived pointer event (motion/press/wheel). The Win32
 // GetCursorPos fallback yields while this is fresh so the two absolute
 // sources never fight over the same frame.
@@ -432,24 +432,31 @@ inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
   return vk;
 }
 
+bool relative_pointer_active(ULONGLONG now) {
+  return g_native_input.mouse_active_recent(300) ||
+         longan::pointer_event_recent(now, g_last_raw_mouse_ms.load(), 300);
+}
+
+void record_physical_pointer(ULONGLONG now) {
+  g_physical_pointer_seen.store(true);
+  g_controller_active.store(false);
+  g_last_mouse_move_ms.store(now);
+}
+
 void feed_core_pointer(CoreWindow const& window,
                        winrt::Windows::Foundation::Point point) {
-  // Only defer to MouseDevice while relative deltas arrived recently (<300ms);
-  // never permanently lock out CoreWindow pointer motion on Xbox UWP.
-  const ULONGLONG now = GetTickCount64();
-  const ULONGLONG last_raw = g_last_raw_mouse_ms.load();
-  if (g_uwp_raw_mouse.load() && last_raw != 0 && (now - last_raw) < 300) return;
+  const auto now = GetTickCount64();
+  g_last_core_pointer_ms.store(now);
+  record_physical_pointer(now);
+  if (relative_pointer_active(now)) return;
   const auto bounds = window.Bounds();
-  if (bounds.Width <= 0 || bounds.Height <= 0) return;
+  if (!(bounds.Width > 0) || !(bounds.Height > 0) ||
+      !std::isfinite(point.X) || !std::isfinite(point.Y)) return;
   int w, h;
   trt_display_size(&w, &h);
-  if (w <= 0) w = 1920;
-  if (h <= 0) h = 1080;
-  const int x = std::clamp(static_cast<int>(point.X * w / bounds.Width), 0, w - 1);
-  const int y = std::clamp(static_cast<int>(point.Y * h / bounds.Height), 0, h - 1);
+  const int x = static_cast<int>(std::clamp(point.X / bounds.Width, 0.f, 1.f) * (w - 1));
+  const int y = static_cast<int>(std::clamp(point.Y / bounds.Height, 0.f, 1.f) * (h - 1));
   trt_input_pointer_move(x, y, false);
-  g_last_mouse_move_ms.store(now);
-  g_last_core_pointer_ms.store(now);
 }
 
 inline int host_mouse_btn_for_press(winrt::Windows::UI::Input::PointerUpdateKind k) {
@@ -472,66 +479,52 @@ inline int host_mouse_btn_for_release(winrt::Windows::UI::Input::PointerUpdateKi
   return -1;
 }
 
-void poll_host_gamepads(XINPUT_STATE* pad0_out, bool* pad0_ok_out) {
+XINPUT_GAMEPAD keyboard_as_controller() {
+  XINPUT_GAMEPAD pad{};
+  const auto key = [](int vk) { return trt_key_down(vk); };
+  if (key(VK_UP)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
+  if (key(VK_DOWN)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
+  if (key(VK_LEFT)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
+  if (key(VK_RIGHT)) pad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+  if (key(VK_RETURN) || key(VK_SPACE) || key('Z')) pad.wButtons |= XINPUT_GAMEPAD_A;
+  if (key(VK_ESCAPE) || key('C')) pad.wButtons |= XINPUT_GAMEPAD_B;
+  if (key('X')) pad.wButtons |= XINPUT_GAMEPAD_X;
+  if (key(VK_SHIFT) || key('V')) pad.bLeftTrigger = 255;
+  const auto axis = [&](int positive, int negative) -> SHORT {
+    const bool p = key(positive), n = key(negative);
+    return p == n ? 0 : p ? 32767 : -32768;
+  };
+  pad.sThumbLX = axis('D', 'A');
+  pad.sThumbLY = axis('W', 'S');
+  return pad;
+}
+
+void poll_host_gamepads(XINPUT_STATE* pad0_out, bool* pad0_ok_out,
+                        bool starting_guest = false) {
+  XINPUT_STATE states[4]{};
+  bool available[4]{};
+  int first = -1;
   for (DWORD idx = 0; idx < 4; ++idx) {
-    XINPUT_STATE xs{};
-    bool ok = (XInputGetState(idx, &xs) == ERROR_SUCCESS);
-    // Host cursor and launcher use physical pad state. Only the guest
-    // receives keyboard-backed buttons, so they cannot feed back into KBM.
-    if (idx == 0) {
-      if (pad0_out) *pad0_out = xs;
-      if (pad0_ok_out) *pad0_ok_out = ok;
-    }
-    // Games that expose only a controller prompt still need to be operable
-    // when the user has a keyboard. Feed a small keyboard layout into the
-    // guest virtual XInput slot while a game is running.
-    if (idx == 0 && g_guest_running.load()) {
-      const auto key = [](int vk) { return trt_key_down(vk); };
-      const bool up = key(VK_UP), down = key(VK_DOWN);
-      const bool left = key(VK_LEFT), right = key(VK_RIGHT);
-      const bool accept = key(VK_RETURN) || key(VK_SPACE) || key('Z');
-      const bool cancel = key(VK_ESCAPE) || key('C');
-      const bool shoot = key('X');
-      const bool lock = key(VK_SHIFT) || key('V');
-      const bool wasd_left = key('A') && !key('D');
-      const bool wasd_right = key('D') && !key('A');
-      const bool wasd_up = key('W') && !key('S');
-      const bool wasd_down = key('S') && !key('W');
-      const bool keyboard_pad = up || down || left || right || accept ||
-                                cancel || shoot || lock || wasd_left ||
-                                wasd_right || wasd_up || wasd_down;
-      // Advertise the keyboard-backed pad from startup so controller-aware
-      // games enumerate it before the first key press.
-      ok = true;
-      if (keyboard_pad) {
-        if (up) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP;
-        if (down) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
-        if (left) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
-        if (right) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT;
-        if (accept) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_A;
-        if (cancel) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_B;
-        if (shoot) xs.Gamepad.wButtons |= XINPUT_GAMEPAD_X;
-        if (lock) xs.Gamepad.bLeftTrigger = 255;
-        if (wasd_right) xs.Gamepad.sThumbLX = 32767;
-        else if (wasd_left) xs.Gamepad.sThumbLX = -32768;
-        if (wasd_up) xs.Gamepad.sThumbLY = 32767;
-        else if (wasd_down) xs.Gamepad.sThumbLY = -32768;
-        static unsigned keyboard_pad_trace = 0;
-        if (keyboard_pad_trace++ < 16) {
-          char line[144];
-          snprintf(line, sizeof(line),
-                   "input: keyboard-to-XInput buttons=%04x lx=%d ly=%d",
-                   xs.Gamepad.wButtons, xs.Gamepad.sThumbLX,
-                   xs.Gamepad.sThumbLY);
-          longan::log_line(line);
-        }
-      }
-    }
-    trt_input_pad_state_n(idx, ok, xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY,
-                          xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY,
-                          xs.Gamepad.wButtons, xs.Gamepad.bLeftTrigger,
-                          xs.Gamepad.bRightTrigger);
-    if (ok) {
+    available[idx] = XInputGetState(idx, &states[idx]) == ERROR_SUCCESS;
+    if (available[idx] && first < 0) first = static_cast<int>(idx);
+  }
+  if (pad0_out) *pad0_out = first >= 0 ? states[first] : XINPUT_STATE{};
+  if (pad0_ok_out) *pad0_ok_out = first >= 0;
+
+  // The launcher uses the first available physical controller. The guest
+  // retains Windows slot numbers and has one translation route at a time.
+  const bool guest = starting_guest || g_guest_running.load();
+  const auto route = guest ? longan::route_gamepads(g_guest_input_mode, first >= 0, g_mouse_mode)
+                           : longan::guest_pad_route::physical;
+  for (DWORD idx = 0; idx < 4; ++idx) {
+    const bool physical = route == longan::guest_pad_route::physical && available[idx];
+    const bool virtual_pad = route == longan::guest_pad_route::keyboard && idx == 0;
+    const XINPUT_GAMEPAD pad = physical ? states[idx].Gamepad
+        : virtual_pad ? keyboard_as_controller() : XINPUT_GAMEPAD{};
+    trt_input_pad_state_n(idx, physical || virtual_pad, pad.sThumbLX, pad.sThumbLY,
+                          pad.sThumbRX, pad.sThumbRY, pad.wButtons,
+                          pad.bLeftTrigger, pad.bRightTrigger);
+    if (available[idx]) {
       u16 l = 0, r = 0;
       if (trt_pad_get_vibration(idx, &l, &r)) {
         XINPUT_VIBRATION xv{l, r};
@@ -3055,9 +3048,6 @@ struct tiramisu_host
         });
     m_pp = window.PointerPressed([](CoreWindow const& sender,
                                     PointerEventArgs const& a) {
-      g_controller_active.store(false);
-      g_last_mouse_move_ms.store(GetTickCount64());
-      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_press(point.Properties().PointerUpdateKind());
@@ -3072,18 +3062,13 @@ struct tiramisu_host
     });
     m_pr = window.PointerReleased([this](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
-      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_release(point.Properties().PointerUpdateKind());
-      if (btn >= 0) trt_input_mouse_button(btn, false);
-      if (btn == 0) launcher_click();
+      if (btn >= 0 && trt_input_mouse_button(btn, false) && btn == 0) launcher_click();
     });
     m_pm = window.PointerMoved([](CoreWindow const& sender,
                                   PointerEventArgs const& a) {
-      g_controller_active.store(false);
-      g_last_mouse_move_ms.store(GetTickCount64());
-      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -3091,6 +3076,7 @@ struct tiramisu_host
       }
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
+      if (g_native_input.mouse_active_recent(300)) return;
       const auto properties = point.Properties();
       const bool held[5] = {properties.IsLeftButtonPressed(),
                             properties.IsRightButtonPressed(),
@@ -3114,8 +3100,7 @@ struct tiramisu_host
     });
     m_pw = window.PointerWheelChanged([](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
-      if (g_native_input.mouse_active()) return;
-      g_controller_active.store(false);
+      if (g_native_input.wheel_active_recent()) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       trt_input_wheel(static_cast<i32>(point.Properties().MouseWheelDelta()));
@@ -3745,12 +3730,11 @@ struct tiramisu_host
       if (m_mouse_device) {
         m_mm = m_mouse_device.MouseMoved(
             [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
-          if (g_native_input.mouse_active()) return;
+          if (g_native_input.mouse_active_recent(300)) return;
           const auto d = a.MouseDelta();
           if (d.X == 0 && d.Y == 0) return;
           const ULONGLONG now = GetTickCount64();
-          g_controller_active.store(false);
-          g_last_mouse_move_ms.store(now);
+          record_physical_pointer(now);
           g_last_raw_mouse_ms.store(now);
           if (!g_uwp_raw_mouse.exchange(true))
             longan::log_line("input: physical relative mouse motion received");
@@ -3777,8 +3761,9 @@ struct tiramisu_host
       system_arrow = CoreCursor(CoreCursorType::Arrow, 0);
       active_window.PointerCursor(system_arrow);
     } catch (...) {}
-    bool software_hardware_pointer = false;
-    bool cursor_update_failed = false;
+    bool system_cursor_hidden = false;
+    ULONGLONG next_cursor_update_ms = 0;
+    bool cursor_error_logged = false;
     if (!g_booted) {
       g_booted = true;
       boot_all();
@@ -3846,7 +3831,12 @@ struct tiramisu_host
 
         // Adaptive Controller vs KBM detection + CoreWindow::PointerPosition + Win32 GetCursorPos fallback:
         const ULONGLONG now_input_ms = GetTickCount64();
-        {
+        if (g_input_focused) {
+          if (g_native_input.mouse_active_recent(300)) record_physical_pointer(now_input_ms);
+          const bool relative_active = relative_pointer_active(now_input_ms);
+          const bool native_buttons = g_native_input.mouse_active_recent(300);
+          bool core_pointer_recent = longan::pointer_event_recent(
+              now_input_ms, g_last_core_pointer_ms.load(), 500);
           // 1) WinRT CoreWindow::PointerPosition() poll
           if (m_window) {
             try {
@@ -3856,15 +3846,15 @@ struct tiramisu_host
               if (bnd.Width > 0 && bnd.Height > 0) {
                 const float rx = pos.X - bnd.X;
                 const float ry = pos.Y - bnd.Y;
-                if (last_cw_x > -9000.0f &&
+                if (!relative_active && !core_pointer_recent && last_cw_x > -9000.0f &&
                     (fabsf(rx - last_cw_x) > 0.5f || fabsf(ry - last_cw_y) > 0.5f)) {
                   int dw = 1920, dh = 1080;
                   trt_display_size(&dw, &dh);
                   const int cx = std::clamp((int)(rx * dw / bnd.Width), 0, dw - 1);
                   const int cy = std::clamp((int)(ry * dh / bnd.Height), 0, dh - 1);
                   trt_input_pointer_move(cx, cy, false);
-                  g_controller_active.store(false);
-                  g_last_mouse_move_ms.store(now_input_ms);
+                  record_physical_pointer(now_input_ms);
+                  core_pointer_recent = true;
                 }
                 last_cw_x = rx;
                 last_cw_y = ry;
@@ -3877,9 +3867,6 @@ struct tiramisu_host
           //    This runs in-game too: a title that polls the cursor must not be
           //    left with a frozen pointer just because CoreWindow is silent. It
           //    yields whenever CoreWindow pointer events are live.
-          const ULONGLONG last_core = g_last_core_pointer_ms.load();
-          const bool core_pointer_recent =
-              last_core != 0 && (now_input_ms - last_core) < 500;
           {
             using get_cp_fn = BOOL(WINAPI*)(POINT*);
             using get_aks_fn = SHORT(WINAPI*)(int);
@@ -3897,22 +3884,22 @@ struct tiramisu_host
                 p_get_aks = reinterpret_cast<get_aks_fn>(GetProcAddress(u32, "GetAsyncKeyState"));
               }
             }
-            if (p_get_cp && !core_pointer_recent) {
+            if (p_get_cp) {
               POINT pt{};
               if (p_get_cp(&pt)) {
-                if (last_pt.x != -99999 && (pt.x != last_pt.x || pt.y != last_pt.y)) {
+                if (!relative_active && !core_pointer_recent && last_pt.x != -99999 &&
+                    (pt.x != last_pt.x || pt.y != last_pt.y)) {
                   int dw = 1920, dh = 1080;
                   trt_display_size(&dw, &dh);
                   const int cx = std::clamp((int)pt.x, 0, dw - 1);
                   const int cy = std::clamp((int)pt.y, 0, dh - 1);
                   trt_input_pointer_move(cx, cy, false);
-                  g_controller_active.store(false);
-                  g_last_mouse_move_ms.store(now_input_ms);
+                  record_physical_pointer(now_input_ms);
                 }
                 last_pt = pt;
               }
             }
-            if (p_get_aks && !core_pointer_recent) {
+            if (p_get_aks) {
               static const u16 k_probe_vk[3] = {0x01 /*VK_LBUTTON*/,
                                                 0x02 /*VK_RBUTTON*/,
                                                 0x04 /*VK_MBUTTON*/};
@@ -3920,9 +3907,10 @@ struct tiramisu_host
                 const bool down = (p_get_aks(k_probe_vk[i]) & 0x8000) != 0;
                 if (down == was_btn[i]) continue;
                 was_btn[i] = down;
-                g_controller_active.store(false);
-                if (trt_mouse_button(i) != down) trt_input_mouse_button(i, down);
-                if (i == 0 && !down && !g_guest_running.load()) launcher_click();
+                if (core_pointer_recent || native_buttons) continue;
+                record_physical_pointer(now_input_ms);
+                const bool transitioned = trt_input_mouse_button(i, down);
+                if (i == 0 && transitioned && !down) launcher_click();
               }
             }
           }
@@ -3937,22 +3925,14 @@ struct tiramisu_host
           prev_mx = cur_mx;
           prev_my = cur_my;
         }
-        // Hot-plug: the shell can attach the pointer after launch. Trust either
-        // GameInput's device status or a fresh CoreWindow pointer event, then
-        // hand the cursor from the pad to the real mouse in auto mode.
+        // Allow a physical mouse to appear after launch without changing
+        // any selected mapping or controller slot.
         if (!g_host_mouse_present.load() &&
-            (g_native_input.mouse_connected() || g_last_core_pointer_ms.load() != 0 ||
-             g_last_raw_mouse_ms.load() != 0)) {
+            (g_native_input.mouse_connected() || g_physical_pointer_seen.load())) {
           g_host_mouse_present.store(true);
           longan::log_line("input: mouse connected -> hardware pointer active");
         }
-        if (g_host_mouse_present.load() && g_auto_pad_mouse.load() &&
-            g_guest_running.load()) {
-          g_auto_pad_mouse.store(false);
-          g_mouse_mode = false;
-          longan::log_line("input: hardware mouse active -> pad-as-mouse OFF");
-        }
-        if (g_native_input.mouse_active() || g_native_input.keyboard_active() ||
+        if (g_native_input.mouse_active_recent(300) || g_native_input.keyboard_active() ||
             (!pad_ok && (g_native_input.mouse_connected() ||
                          g_native_input.keyboard_connected()))) {
           g_controller_active.store(false);
@@ -3987,32 +3967,35 @@ struct tiramisu_host
           longan::ui_set_pointer_pos(pmx, pmy);
         }
         const bool guest_running = g_guest_running.load();
-        const bool hw_pointer = g_host_mouse_present.load() ||
-                                g_native_input.mouse_connected();
-        // Use our high-contrast arrow only while absolute hardware events
-        // are arriving. If the broker stops relaying them, restore the system
-        // arrow instead of leaving a frozen or invisible cursor.
-        const ULONGLONG absolute_event = g_last_core_pointer_ms.load();
-        const bool can_draw_hardware = system_arrow && !guest_running && g_input_focused &&
-            hw_pointer && !g_controller_active.load() && absolute_event &&
-            now_input_ms - absolute_event < 2500 && !longan::boot_anim_is_active() &&
-            longan::ui_can_draw_cursor();
-        if (!cursor_update_failed && can_draw_hardware != software_hardware_pointer) {
+        const bool virtual_pointer = g_mouse_mode || g_kbd_mouse_mode ||
+            longan::pointer_event_recent(now_input_ms, m_last_web_pointer_ms, 12000);
+        const bool launcher_drawing = !guest_running || g_quick_menu_open;
+        const auto cursor = longan::choose_cursor({
+            g_input_focused, longan::boot_anim_is_active(), guest_running,
+            g_quick_menu_open, launcher_drawing && longan::ui_can_draw_cursor(),
+            longan::guest_cursor_overlay_ready(now_input_ms), g_physical_pointer_seen.load(),
+            virtual_pointer, g_controller_active.load(),
+        });
+        const bool hide_system = cursor != longan::cursor_owner::system;
+        if (system_arrow && hide_system != system_cursor_hidden &&
+            now_input_ms >= next_cursor_update_ms) {
           try {
-            active_window.PointerCursor(can_draw_hardware ? CoreCursor{nullptr} : system_arrow);
-            software_hardware_pointer = can_draw_hardware;
+            active_window.PointerCursor(hide_system ? CoreCursor{nullptr} : system_arrow);
+            system_cursor_hidden = hide_system;
+            longan::log_line(hide_system ? "input: Tiramisu owns the pointer"
+                                        : "input: shell owns the pointer");
           } catch (...) {
-            cursor_update_failed = true;
-            try { active_window.PointerCursor(system_arrow); } catch (...) {}
-            software_hardware_pointer = false;
+            next_cursor_update_ms = now_input_ms + 2000;
+            if (!cursor_error_logged) {
+              longan::log_line("input: shell declined cursor visibility change; will retry");
+              cursor_error_logged = true;
+            }
           }
         }
-        const bool virtual_pointer = !hw_pointer &&
-            (g_mouse_mode || g_kbd_mouse_mode ||
-             (m_last_web_pointer_ms && now_input_ms - m_last_web_pointer_ms < 12000));
-        longan::ui_set_cursor_visible(software_hardware_pointer ||
-                                     (!guest_running && virtual_pointer));
-        longan::set_launcher_cursor_visible(false);
+        const bool draw_pointer = system_cursor_hidden ||
+            (virtual_pointer && !g_host_mouse_present.load());
+        longan::ui_set_cursor_visible(draw_pointer && cursor == longan::cursor_owner::launcher);
+        longan::set_guest_cursor_visible(draw_pointer && cursor == longan::cursor_owner::guest);
 
         // Launcher mouse wheel scrolling across all screens
         if (!g_guest_running.load() && !g_setup_active) {
@@ -4234,6 +4217,7 @@ struct tiramisu_host
             trt_input_release_all();
             trt_input_reset_cursor_mode(false);
             g_mouse_mode = false;
+            g_guest_input_mode = longan::guest_input_mode::automatic;
             longan::webxfer_set_running_game("");
             const std::string gs = get_guest_status();
             if (!gs.empty() && gs != "idle") longan::ui_toast(u82ws(gs), 3.6f);
@@ -4642,23 +4626,13 @@ struct tiramisu_host
                 }
               }
               set_guest_status("running " + ge.name + "…");
-              const std::string input_mode = ge.input_mode.empty() || ge.input_mode == "auto"
-                  ? longan::settings_get().default_input : ge.input_mode;
-              g_auto_pad_mouse.store(false);
-              g_mouse_mode = input_mode == "pad2kbm";
-              if (input_mode == "auto" && !g_host_mouse_present.load()) {
-                // Auto mode with no hardware pointer available: launch with the
-                // pad-driven cursor rather than a title that polls the mouse and
-                // never receives a single event.
-                g_mouse_mode = true;
-                g_auto_pad_mouse.store(true);
-                longan::log_line("input: auto input mode, no hardware pointer -> "
-                                 "pad-as-mouse ON for this launch");
-              }
+              g_guest_input_mode = longan::resolve_input_mode(
+                  longan::settings_get_global().default_input, ge.input_mode);
+              g_mouse_mode = g_guest_input_mode == longan::guest_input_mode::pad_as_mouse;
               trt_input_release_all();
-              // Keep the visible console cursor active for all games unless
-              // the guest explicitly pins it to a 1x1 mouselook trap.
-              trt_input_reset_cursor_mode(true);
+              poll_host_gamepads(nullptr, nullptr, true);
+              // Start visible. A guest can hide or lock its pointer for mouselook.
+              trt_input_reset_cursor_mode(false);
               longan::webxfer_set_running_game(want);
               longan::webxfer_set_launch_result(want, "started");
               longan::host_ap_on_result(want, "started");

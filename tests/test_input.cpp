@@ -1,6 +1,9 @@
 // tiramisu/tests/test_input.cpp
 // Offline proof for the input bridge: host feed -> user32 getters + pump.
 #include "../src/trt/input.h"
+#include "../src/host/cursor_policy.h"
+#include "../src/host/cursor_art.h"
+#include "../src/host/input_policy.h"
 #include "../src/trt/pe.h"  // TRT_STDCALL: these are guest-ABI bridge fns —
                             // the local declaration MUST match the
                             // definition's convention or the arguments
@@ -11,6 +14,13 @@
 #include <stdint.h>
 
 extern "C" {
+u16 TRT_STDCALL trt_RegisterClassExW(const void*);
+void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
+                                     int, int, int, int, void*, void*, void*, void*);
+void* TRT_STDCALL trt_SetFocus(void*);
+void* TRT_STDCALL trt_GetFocus(void);
+int TRT_STDCALL trt_ShowWindow(void*, int);
+int TRT_STDCALL trt_PostMessageW(void*, u32, u64, i64);
 int TRT_STDCALL trt_RegisterRawInputDevices(const void*, u32, u32);
 u32 TRT_STDCALL trt_GetRawInputData(void*, u32, void*, u32*, u32);
 u32 TRT_STDCALL trt_GetRawInputBuffer(void*, u32*, u32);
@@ -46,6 +56,25 @@ int failures = 0;
     else { printf("  FAIL %s\n", msg); ++failures; }  \
   } while (0)
 
+struct focus_notification { u64 window; u32 message; u64 other; i64 reserved; };
+static focus_notification focus_events[8];
+static unsigned focus_event_count = 0;
+static u64 created_window[8]{};
+static unsigned created_window_count = 0;
+static u32 rejected_window_message = 0;
+
+
+static i64 TRT_STDCALL focus_window_proc(u64 window, u32 message, u64 other, i64 reserved) {
+  if (message == 0x81u && rejected_window_message == message) return 0;
+  if (message == 1) {
+    if (rejected_window_message == message) return -1;
+    if (created_window_count < 8) created_window[created_window_count++] = window;
+  }
+  if ((message == 7 || message == 8) && focus_event_count < 8)
+    focus_events[focus_event_count++] = {window, message, other, reserved};
+  return message == 0x81;
+}
+
 int main() {
   setvbuf(stdout, NULL, _IONBF, 0);
   printf("tiramisu offline input bridge test\n");
@@ -77,11 +106,17 @@ int main() {
   trt_mouse_delta(&dx, &dy);
   CHECK(dx == 0 && dy == 0, "deltas empty after consume");
 
-  // buttons
-  trt_input_mouse_button(0, true);
-  CHECK(trt_mouse_button(0), "left button down");
-  trt_input_mouse_button(0, false);
-  CHECK(!trt_mouse_button(0), "left button up");
+  // Multiple Xbox input providers can report the same physical edge.
+  trt_msg queued{};
+  while (trt_msg_peek(&queued, true)) {}
+  CHECK(trt_input_mouse_button(0, true) && trt_mouse_button(0), "left button down");
+  CHECK(!trt_input_mouse_button(0, true), "second provider's press is ignored");
+  CHECK(trt_input_mouse_button(0, false) && !trt_mouse_button(0), "left button up");
+  CHECK(!trt_input_mouse_button(0, false), "second provider's release is ignored");
+  CHECK(trt_msg_peek(&queued, true) && queued.message == 0x0201 &&
+            trt_msg_peek(&queued, true) && queued.message == 0x0202 &&
+            !trt_msg_peek(&queued, true),
+        "overlapping physical providers generate one click");
 
   // pad
   trt_input_pad_state(32767, 0, 0, -32768, 0x1000 /*RT*/, 0, 255);
@@ -489,6 +524,144 @@ int main() {
           "suspend releases every pad button, stick and trigger");
     CHECK(!trt_mouse_button(0) && !trt_key_down('W'),
           "suspend releases mouse buttons and keys");
+  }
+
+  {
+    using longan::cursor_owner;
+    longan::cursor_context cursor{true, false, false, false, true, false, true, false, false};
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::launcher,
+          "hardware input keeps the dashboard arrow after the pointer stops");
+    cursor.guest_running = true;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::system,
+          "a guest without a composited cursor leaves the shell arrow available");
+    cursor.guest_can_draw = true;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::guest,
+          "a live guest overlay draws the Tiramisu arrow");
+    cursor.quick_menu = true;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::launcher,
+          "opening the quick menu returns cursor ownership to the launcher");
+    cursor.controller_active = true;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::hidden,
+          "controller-only UI can hide the pointer");
+    cursor.virtual_pointer = true;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::launcher,
+          "virtual pointer remains visible when selected");
+    cursor.focused = false;
+    CHECK(longan::choose_cursor(cursor) == cursor_owner::system,
+          "losing focus returns cursor ownership to the shell");
+    CHECK(longan::pointer_event_recent(1000, 850, 300) &&
+              !longan::pointer_event_recent(1000, 1001, 300) &&
+              !longan::pointer_event_recent(1000, 700, 300),
+          "arbitration handles idle and newly published event times");
+  }
+  {
+    using namespace longan;
+    const auto auto_mode = resolve_input_mode("auto", "");
+    CHECK(route_gamepads(auto_mode, true, false) == guest_pad_route::physical &&
+              route_gamepads(auto_mode, false, false) == guest_pad_route::physical,
+          "Auto exposes physical pad slots with or without a controller connected");
+    CHECK(resolve_input_mode("controller", "auto") == guest_input_mode::controller &&
+              route_gamepads(guest_input_mode::controller, false, false) == guest_pad_route::keyboard &&
+              route_gamepads(guest_input_mode::controller, true, false) == guest_pad_route::physical,
+          "one global controller preference provides a keyboard fallback without merging devices");
+    CHECK(route_gamepads(auto_mode, true, true) == guest_pad_route::disabled &&
+              route_gamepads(resolve_input_mode("controller", "kbm"), true, false) ==
+                  guest_pad_route::disabled,
+          "explicit keyboard and mouse modes do not double-report controller input");
+    CHECK(cursor_height(720) == 12 && cursor_height(1080) == 18 && cursor_height(2160) == 32,
+          "cursor renderers share compact output-pixel sizes");
+  }
+  {
+    struct {
+      u32 size, style;
+      void* proc;
+      int class_extra, window_extra;
+      void* instance;
+      void* icon;
+      void* cursor;
+      void* background;
+      const wchar_t* menu;
+      const wchar_t* name;
+      void* small_icon;
+    } cls{};
+    cls.size = sizeof(cls);
+    cls.name = L"TiramisuFocusTest";
+    cls.proc = reinterpret_cast<void*>(&focus_window_proc);
+    CHECK(trt_RegisterClassExW(&cls) != 0, "registered a window procedure for focus tests");
+    constexpr u32 visible = 0x10000000u;
+    constexpr u32 child_style = 0x40000000u;
+    auto* first = trt_CreateWindowExW(0, cls.name, nullptr, visible, 0, 0, 640, 480,
+                                      nullptr, nullptr, nullptr, nullptr);
+    auto* helper = trt_CreateWindowExW(0, cls.name, nullptr, 0, 0, 0, 320, 240,
+                                       nullptr, nullptr, nullptr, nullptr);
+    CHECK(helper && trt_GetFocus() == first,
+          "a hidden helper window leaves the visible window focused");
+    auto* child = trt_CreateWindowExW(0, cls.name, nullptr, visible | child_style,
+                                      0, 0, 64, 64, first, nullptr, nullptr, nullptr);
+    CHECK(child && trt_GetFocus() == first,
+          "creating a visible child does not take keyboard focus");
+    CHECK(trt_ShowWindow(helper, 8 /*SW_SHOWNA*/) == 0 && trt_GetFocus() == first,
+          "showing a helper without activation keeps the existing focus");
+    auto* second = trt_CreateWindowExW(0, cls.name, nullptr, 0, 0, 0, 640, 480,
+                                       nullptr, nullptr, nullptr, nullptr);
+    CHECK(trt_ShowWindow(second, 5 /*SW_SHOW*/) == 0 && trt_GetFocus() == second,
+          "showing a top-level window with activation focuses it");
+    focus_event_count = 0;
+    CHECK(first && second && first != second, "created distinct guest windows");
+    struct {
+      u64 window;
+      u32 message;
+      u32 padding;
+      u64 wp;
+      i64 lp;
+      u32 time;
+      i32 point[2];
+    } queued{};
+    CHECK(created_window_count == 4 &&
+              created_window[0] == reinterpret_cast<u64>(first) &&
+              created_window[3] == reinterpret_cast<u64>(second),
+          "CreateWindowEx sends WM_CREATE synchronously even without creation data");
+    CHECK(!trt_PeekMessageW(&queued, nullptr, 1, 1, 1),
+          "registered windows receive no duplicate queued WM_CREATE");
+    rejected_window_message = 0x81u;
+    CHECK(!trt_CreateWindowExW(0, cls.name, nullptr, visible, 0, 0, 640, 480,
+                               nullptr, nullptr, nullptr, nullptr) && trt_GetFocus() == second,
+          "WM_NCCREATE can reject a window without taking focus");
+    rejected_window_message = 1;
+    CHECK(!trt_CreateWindowExW(0, cls.name, nullptr, visible, 0, 0, 640, 480,
+                               nullptr, nullptr, nullptr, nullptr) && trt_GetFocus() == second,
+          "WM_CREATE returning minus one aborts window creation");
+    rejected_window_message = 0;
+    CHECK(trt_PostMessageW(first, 0x0401u, 42, 0) &&
+              trt_PeekMessageW(&queued, nullptr, 0x0401u, 0x0401u, 1) &&
+              queued.window == reinterpret_cast<u64>(first) && queued.wp == 42,
+          "PostMessage delivers to the specified window despite a different focus");
+    CHECK(trt_PostMessageW(nullptr, 0x0402u, 0, 0) &&
+              trt_PeekMessageW(&queued, nullptr, 0x0402u, 0x0402u, 1) &&
+              queued.window == 0,
+          "PostMessage with a null window stays a thread message");
+    CHECK(trt_SetFocus(first) == second && trt_GetFocus() == first,
+          "SetFocus returns the previous window and updates the new focus");
+    CHECK(focus_event_count == 2 &&
+              focus_events[0].window == reinterpret_cast<u64>(second) &&
+              focus_events[0].message == 8 &&
+              focus_events[0].other == reinterpret_cast<u64>(first) &&
+              focus_events[0].reserved == 0 &&
+              focus_events[1].window == reinterpret_cast<u64>(first) &&
+              focus_events[1].message == 7 &&
+              focus_events[1].other == reinterpret_cast<u64>(second) &&
+              focus_events[1].reserved == 0,
+          "focus transfer synchronously notifies both windows with the counterpart HWND");
+    CHECK(trt_SetFocus(first) == first && focus_event_count == 2,
+          "retaining the same focus sends no duplicate notifications");
+    CHECK(trt_SetFocus(reinterpret_cast<void*>(0xDEAD)) == nullptr &&
+              trt_GetFocus() == first && focus_event_count == 2,
+          "invalid focus target leaves the current window unchanged");
+    CHECK(trt_SetFocus(nullptr) == first && trt_GetFocus() == nullptr &&
+              focus_event_count == 3 &&
+              focus_events[2].window == reinterpret_cast<u64>(first) &&
+              focus_events[2].message == 8 && focus_events[2].other == 0,
+          "clearing focus notifies the window that lost it");
   }
 
   printf(failures ? "\nRESULT: %d FAILURES\n" : "\nRESULT: ALL PASS\n",

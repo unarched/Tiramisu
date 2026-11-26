@@ -16,7 +16,10 @@ typedef struct trt_msg {
   i64 lparam;
   u32 pointer_flags;
   u32 pointer_change;
+  u64 target_window;  // zero routes host input to the active window
 } trt_msg;
+
+#define TRT_MSG_THREAD_TARGET (~(u64)0)
 
 #define TRT_MSG_RING 512
 
@@ -35,7 +38,8 @@ void trt_input_set_cursor_pos(int x, int y);
 void trt_input_set_clip_rect(bool enable, i32 left, i32 top, i32 right, i32 bottom);
 bool trt_input_get_clip_rect(i32* left, i32* top, i32* right, i32* bottom);
 void trt_input_mouse_delta_raw(i32 dx, i32 dy);        // REAL mouse deltas (MouseDevice)
-void trt_input_mouse_button(int btn /*0=L 1=R 2=M 3=X1 4=X2*/, bool down);
+// Returns true when the event changes the button state.
+bool trt_input_mouse_button(int btn /*0=L 1=R 2=M 3=X1 4=X2*/, bool down);
 void trt_input_wheel(i32 delta);
 void trt_input_pad_state(i16 lx, i16 ly, i16 rx, i16 ry,
                          u16 buttons /*XINPUT_GAMEPAD_* bits*/,
@@ -96,6 +100,7 @@ void trt_input_accept_pointer(const trt_msg* message, u64 window, u32 time);
 bool trt_input_get_mouse_pointer(u32 id, trt_mouse_pointer* out);
 
 bool trt_msg_post(u32 message, u64 wparam, i64 lparam);
+bool trt_msg_post_to(u64 target_window, u32 message, u64 wparam, i64 lparam);
 bool trt_msg_peek(trt_msg* out, bool remove);
 bool trt_msg_peek_range(trt_msg* out, u32 minimum, u32 maximum, bool remove);
 bool trt_msg_pending();

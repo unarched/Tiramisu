@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 extern "C" {
+int TRT_STDCALL trt_GetClientRect(void* hwnd, void* rect);
 int trt_bridge_register_kernel32(void);
 int trt_bridge_register_user32(void);
 void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*, u32,
@@ -577,6 +578,16 @@ int main(int argc, char** argv) {
           "IDXGIFactory::CreateSwapChain (4-arg) yields proxy swapchain");
     if (proxy_sc) {
       const void** svt = *(const void***)proxy_sc;
+      struct { u32 fields[5]; u32 guard[2]; } fullscreen{
+          {9, 9, 9, 9, 9}, {0xababababu, 0xcdcdcdcdu}};
+      using fullscreen_desc_t = int (TRT_GUEST_ABI *)(void*, void*);
+      CHECK(((fullscreen_desc_t)svt[19])(proxy_sc, fullscreen.fields) == 0 &&
+                fullscreen.fields[0] == 0 && fullscreen.fields[1] == 0 &&
+                fullscreen.fields[2] == 0 && fullscreen.fields[3] == 0 &&
+                fullscreen.fields[4] == 1,
+            "GetFullscreenDesc writes Windowed at the Win32 ABI offset");
+      CHECK(fullscreen.guard[0] == 0xababababu && fullscreen.guard[1] == 0xcdcdcdcdu,
+            "GetFullscreenDesc stays within the 20-byte structure");
       using fs_t = int (TRT_GUEST_ABI *)(void*, int, void*);
       using rb_t = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32);
       using pres_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
@@ -628,11 +639,32 @@ int main(int argc, char** argv) {
         CHECK(((get_hwnd_fn)window_vt[20])(window_chain, &reported_window) == 0 &&
                   reported_window == window,
               "GetHwnd returns the HWND associated with the guest swap chain");
-        trt_SetWindowPos(window, nullptr, 0, 0, 640, 360, 0);
+        using resize_target_fn = int (TRT_GUEST_ABI *)(void*, const void*);
+        const u32 mode[7]{640, 360, 60, 1, 87, 0, 0};
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, mode) == 0 &&
+                  g_requested_width == 800 && g_requested_height == 600,
+              "windowed ResizeTarget leaves the backbuffer alone until ResizeBuffers");
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, nullptr) ==
+                  static_cast<int>(0x887a0001u),
+              "ResizeTarget rejects a null target mode");
         CHECK(((rb_t)window_vt[13])(window_chain, 0, 0, 0, 0, 0) == 0 &&
                   g_requested_width == 640 && g_requested_height == 360,
               "zero-sized ResizeBuffers follows the resized guest window");
-        trt_SetWindowPos(window, nullptr, 0, 0, 0, 0, 0);
+        trt_gpu_resize_stats resize{};
+        trt_gpu_get_resize_stats(&resize);
+        CHECK(resize.target_calls == 2 && resize.buffer_calls >= 1 &&
+                  resize.buffer_requested_width == 0 && resize.buffer_requested_height == 0 &&
+                  resize.buffer_client_width == 640 && resize.buffer_client_height == 360 &&
+                  resize.buffer_result == 0,
+              "resize diagnostics report the zero request and resolved window geometry");
+
+        const u32 empty_mode[7]{};
+        i32 client[4]{};
+        CHECK(((resize_target_fn)window_vt[14])(window_chain, empty_mode) == 0 &&
+                  trt_GetClientRect(window, client) &&
+                  client[2] == 0 && client[3] == 0 &&
+                  g_requested_width == 640 && g_requested_height == 360,
+              "windowed ResizeTarget accepts an empty mode without replacing buffers");
         CHECK(((rb_t)window_vt[13])(window_chain, 0, 0, 0, 0, 0) == 0 &&
                   g_requested_width == 640 && g_requested_height == 360,
               "an empty guest window retains the last usable swap-chain size");

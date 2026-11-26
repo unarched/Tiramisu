@@ -5,6 +5,8 @@
 // CoreWindow swapchain is cleanly rebound to that ID3D12CommandQueue and
 // restored to D3D11 when the guest exits back to the launcher.
 #include "swapchain.h"
+#include "cursor_policy.h"
+#include "cursor_art.h"
 #include "console_detect.h"
 #include "host_log.h"
 #include "d3d9_backend.hpp"
@@ -62,6 +64,12 @@ std::atomic<unsigned> g_surface_guest_rtv{0}, g_surface_other_rtv{0};
 std::atomic<unsigned> g_other_surface_samples{0}, g_other_lit_pixels{0};
 std::atomic<unsigned> g_other_width{0}, g_other_height{0}, g_other_format{0};
 std::atomic<int> g_other_surface_result{0};
+surface_sample g_shader_input_surface;
+std::atomic<unsigned> g_shader_input_snapshots{0}, g_shader_input_bound{0};
+std::atomic<unsigned> g_shader_input_samples{0}, g_shader_input_lit{0};
+std::atomic<unsigned> g_shader_input_slot{0}, g_shader_input_width{0};
+std::atomic<unsigned> g_shader_input_height{0}, g_shader_input_format{0};
+std::atomic<int> g_shader_input_result{0};
 std::atomic<int> g_surface_probe_result{0};
 unsigned g_surface_probe_interval = 0;
 winrt::com_ptr<IDXGIFactory2> g_factory;
@@ -69,7 +77,8 @@ winrt::com_ptr<IDXGIFactory6> g_factory6;
 winrt::com_ptr<ID3D12Device> g_d3d12_device;
 winrt::com_ptr<IDXGISwapChain3> g_d3d12_swap;
 bool g_in_d3d12 = false;
-std::atomic<bool> g_launcher_cursor_visible{false};
+std::atomic<bool> g_guest_cursor_visible{false};
+std::atomic<uint64_t> g_guest_cursor_present_ms{0};
 unsigned g_w = 1280, g_h = 720;
 unsigned g_backbuffer_width = 1280, g_backbuffer_height = 720;
 unsigned g_fl = D3D_FEATURE_LEVEL_11_0;
@@ -382,36 +391,40 @@ int TRT_GUEST_ABI get_d3d11_backbuffer(u32 index, const void* iid, void** out) {
 
 // Paint a small arrow on the presentation surface. ClearView writes just
 // these rectangles and leaves the guest's shaders and bindings intact.
-void draw_pointer_impl(bool launcher) {
+void draw_guest_cursor() {
   if (!g_ctx || !g_rtv || !g_w || !g_h) return;
-  if (launcher && !g_launcher_cursor_visible.load()) return;
+  if (!g_guest_cursor_visible.load()) return;
   int x, y;
-  if (!trt_cursor_snapshot(&x, &y) && !launcher) return;
+  if (!trt_cursor_snapshot(&x, &y)) return;
   x = static_cast<int>(static_cast<i64>(x) * g_backbuffer_width / g_w);
   y = static_cast<int>(static_cast<i64>(y) * g_backbuffer_height / g_h);
   const int target_width = static_cast<int>(g_backbuffer_width);
   const int target_height = static_cast<int>(g_backbuffer_height);
-  const int scale = target_height >= 900 ? 2 : 1;
-  static constexpr const char* rows[] = {
+  constexpr const char* rows[] = {
       "#", "##", "#o#", "#oo#", "#ooo#", "#oooo#", "#ooooo#", "#oooooo#",
       "#ooooooo#", "#oooooooo#", "#ooooooooo#", "#ooooo#####",
-      "#oo#oo#", "#o##oo#", "##..#oo#", "#...#oo#", ".....###",
+      "#oo#oo#", "#o##oo#", "##..#oo#", "#...#oo#", ".....###", ".....##",
   };
-  D3D11_RECT dark[64], light[64];
+  constexpr int height = static_cast<int>(std::size(rows));
+  constexpr int width = 11;
+  const int pixels_high = cursor_height(target_height);
+  const int pixels_wide = (width * pixels_high + height - 1) / height;
+  D3D11_RECT dark[cursor_height(2160) * width], light[cursor_height(2160) * width];
   unsigned n_dark = 0, n_light = 0;
-  for (unsigned row = 0; row < sizeof(rows) / sizeof(rows[0]); ++row) {
-    const int top = y + static_cast<int>(row) * scale;
-    if (top < 0 || top >= target_height) continue;
-    const char* pixels = rows[row];
-    for (int col = 0; pixels[col];) {
-      const int first = col;
-      const char color = pixels[col++];
-      while (pixels[col] == color) ++col;
-      if (color == '.') continue;
-      const int left = std::max(0, x + first * scale);
-      const int right = std::min(target_width, x + col * scale);
-      if (left >= right) continue;
-      const D3D11_RECT rect{left, top, right, std::min(top + scale, target_height)};
+  for (int dy = 0; dy < pixels_high && y + dy < target_height; ++dy) {
+    if (y + dy < 0) continue;
+    const char* row = rows[dy * height / pixels_high];
+    const int len = static_cast<int>(strlen(row));
+    for (int dx = 0; dx < pixels_wide && x + dx < target_width;) {
+      const int first = dx;
+      const auto get = [&](int col) {
+        const int src = col * width / pixels_wide;
+        return src < len ? row[src] : '.';
+      };
+      const char color = get(dx++);
+      while (dx < pixels_wide && x + dx < target_width && get(dx) == color) ++dx;
+      if (color == '.' || x + dx <= 0) continue;
+      const D3D11_RECT rect{std::max(0, x + first), y + dy, x + dx, y + dy + 1};
       if (color == '#') dark[n_dark++] = rect;
       else light[n_light++] = rect;
     }
@@ -560,7 +573,49 @@ void sample_other_render_target(ID3D11RenderTargetView* view, ID3D11Resource* re
   g_other_surface_result.store(hr);
 }
 
+void sample_guest_shader_input() {
+  if (g_shader_input_surface.pending) return;
+  g_shader_input_snapshots.fetch_add(1);
+  ID3D11ShaderResourceView* bound[4]{};
+  g_ctx->PSGetShaderResources(0, static_cast<UINT>(std::size(bound)), bound);
+  bool chosen = false;
+  for (unsigned slot = 0; slot < std::size(bound); ++slot) {
+    winrt::com_ptr<ID3D11ShaderResourceView> view;
+    view.attach(bound[slot]);  // PSGetShaderResources retained every bound view.
+    if (!view) continue;
+    g_shader_input_bound.fetch_add(1);
+    if (chosen) continue;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+    view->GetDesc(&srv);
+    if (srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+        srv.Texture2D.MostDetailedMip != 0) continue;
+    winrt::com_ptr<ID3D11Resource> resource;
+    view->GetResource(resource.put());
+    auto texture = resource.try_as<ID3D11Texture2D>();
+    if (!texture) continue;
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    g_shader_input_slot.store(slot);
+    g_shader_input_width.store(desc.Width);
+    g_shader_input_height.store(desc.Height);
+    g_shader_input_format.store(srv.Format);
+    const HRESULT hr = enqueue_surface_sample(g_shader_input_surface, texture.get(), srv.Format);
+    g_shader_input_result.store(hr);
+    chosen = SUCCEEDED(hr);
+  }
+}
+
 void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
+  if (g_shader_input_surface.pending) {
+    const HRESULT hr = poll_surface_sample(g_shader_input_surface);
+    if (hr == S_OK) {
+      g_shader_input_lit.store(std::max(g_shader_input_lit.load(), g_shader_input_surface.lit));
+      g_shader_input_samples.fetch_add(1);
+    } else if (FAILED(hr)) {
+      g_shader_input_surface.pending = false;
+      g_shader_input_result.store(hr);
+    }
+  }
   if (g_other_surface_probe.pending) {
     const HRESULT hr = poll_surface_sample(g_other_surface_probe);
     if (hr == S_OK) {
@@ -600,6 +655,7 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
     g_surface_probe_result.store(host_hr);
     return;
   }
+  sample_guest_shader_input();
   // Snapshot slot zero at Present without disturbing the guest context. A
   // completed rendering pass may already have unbound its render target.
   winrt::com_ptr<ID3D11RenderTargetView> view;
@@ -626,7 +682,7 @@ void TRT_GUEST_ABI prepare_d3d11_present() {
       measure_surface_pair(g_guest_backbuffer.get(), back.get());
     }
   }
-  draw_pointer_impl(false);
+  draw_guest_pointer();
   begin_guest_draw_sample();
 }
 
@@ -729,6 +785,8 @@ HRESULT create_d3d11_corewindow_swapchain() {
 } // namespace
 
 void swapchain_reset_guest_draw_probe() {
+  g_guest_cursor_present_ms.store(0);
+  g_guest_cursor_visible.store(false);
   if (g_guest_draw_query_active && g_ctx) g_ctx->End(g_guest_draw_query.get());
   g_guest_draw_query = nullptr;
   g_guest_draw_query_active = false;
@@ -756,7 +814,25 @@ void swapchain_reset_guest_draw_probe() {
   g_other_height.store(0);
   g_other_format.store(0);
   g_other_surface_result.store(0);
+  g_shader_input_surface = {};
+  g_shader_input_snapshots.store(0);
+  g_shader_input_bound.store(0);
+  g_shader_input_samples.store(0);
+  g_shader_input_lit.store(0);
+  g_shader_input_slot.store(0);
+  g_shader_input_width.store(0);
+  g_shader_input_height.store(0);
+  g_shader_input_format.store(0);
+  g_shader_input_result.store(0);
   g_surface_probe_interval = 0;
+}
+
+guest_shader_input_probe swapchain_guest_shader_input_probe() {
+  return {g_shader_input_snapshots.load(), g_shader_input_bound.load(),
+          g_shader_input_samples.load(), g_shader_input_lit.load(),
+          g_shader_input_slot.load(), g_shader_input_width.load(),
+          g_shader_input_height.load(), g_shader_input_format.load(),
+          g_shader_input_result.load()};
 }
 
 guest_draw_probe swapchain_guest_draw_probe() {
@@ -771,10 +847,16 @@ guest_draw_probe swapchain_guest_draw_probe() {
 }
 
 
-void draw_pointer(bool launcher) { draw_pointer_impl(launcher); }
-void set_launcher_cursor_visible(bool visible) {
-  g_launcher_cursor_visible.store(visible);
+void draw_guest_pointer() {
+  g_guest_cursor_present_ms.store(g_rtv ? GetTickCount64() : 0);
+  draw_guest_cursor();
 }
+
+bool guest_cursor_overlay_ready(uint64_t now) {
+  return pointer_event_recent(now, g_guest_cursor_present_ms.load(), 2000);
+}
+
+void set_guest_cursor_visible(bool visible) { g_guest_cursor_visible.store(visible); }
 
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
   swapchain_result r{};
@@ -1016,7 +1098,6 @@ void swapchain_present() {
     }
   }
   last_present = now;
-  draw_pointer_impl(true);
   g_swap->Present(vsync ? 1 : 0, 0);
 }
 

@@ -2,6 +2,7 @@
 // Native Direct2D / DirectWrite implementation of the Tiramisu Xbox Series X|S
 // Obsidian & Champagne Glassmorphic Dashboard UI.
 #include "ui.h"
+#include "cursor_art.h"
 #include "boot_anim.h"
 #include "cover_art.h"
 #include "settings.h"
@@ -127,7 +128,7 @@ int selected_settings_section() {
 }
 
 constexpr const wchar_t* k_setting_help[] = {
-    L"Used when a game has its input mode set to Auto.",
+    L"Auto exposes connected devices. Controller enables a keyboard gamepad when none is connected.",
     L"Controls movement speed when a controller drives the pointer.",
     L"Controls scroll speed for the controller wheel shortcut.",
     L"Passes game vibration to a connected controller.",
@@ -2124,8 +2125,8 @@ bool prepare_vector_cursor() {
       return false;
     }
     constexpr D2D1_POINT_2F points[] = {
-        {0.f, 0.f}, {0.f, 21.f}, {5.4f, 16.2f}, {9.4f, 23.5f},
-        {12.6f, 21.8f}, {8.6f, 14.5f}, {15.6f, 14.5f},
+        {0.f, 0.f}, {0.f, 15.5f}, {4.0f, 12.0f}, {7.0f, 17.5f},
+        {9.0f, 16.4f}, {6.2f, 11.2f}, {11.5f, 11.2f},
     };
     sink->BeginFigure(points[0], D2D1_FIGURE_BEGIN_FILLED);
     sink->AddLines(points + 1, static_cast<UINT32>(std::size(points) - 1));
@@ -2143,13 +2144,13 @@ bool prepare_vector_cursor() {
 
 void draw_vector_cursor() {
   if (!g_cursor_visible || g_ptr_x < 0 || g_ptr_y < 0 || !prepare_vector_cursor()) return;
-  const float size = sc(1.15f);
+  const float size = static_cast<float>(cursor_height(g_h)) / 18.f;
   D2D1_MATRIX_3X2_F previous;
   g_ctx->GetTransform(&previous);
   g_ctx->SetTransform(D2D1::Matrix3x2F(size, 0.f, 0.f, size,
                                       static_cast<float>(g_ptr_x), static_cast<float>(g_ptr_y)));
   g_ctx->FillGeometry(g_cursor_shape, g_br_white);
-  g_ctx->DrawGeometry(g_cursor_shape, g_br_ink, 1.6f);
+  g_ctx->DrawGeometry(g_cursor_shape, g_br_ink, 1.15f);
   g_ctx->SetTransform(previous);
 }
 } // namespace
