@@ -1,0 +1,37 @@
+{
+  "date": "2026-11-26",
+  "console": "Xbox Series S, Dev Mode",
+  "package_version": "0.2.4.48",
+  "package_sha256": "68c71487e614ac9f18d676850c78fa762cf5d9483a39da4d3b61e5e68fc61144",
+  "source_commit": "d0150856ef94a1626a2e2c314bc1ae9cd0949d52",
+  "source_patch_sha256": "485b14dcf66e0aad9052a53d3fa0f1981424cae13e23ebcc2797d13f8f06d7de",
+  "entry_point": "Standard dashboard Play with the existing authorized installs",
+  "cuphead": {
+    "guest_entry": true,
+    "d3d11_devices": 1,
+    "d3d11_swap_chains": 1,
+    "successful_presents": 2283,
+    "samples_with_draws_on_intermediate_target": 19,
+    "samples_with_draws_on_guest_back_buffer": 0,
+    "guest_lit_pixels": 0,
+    "host_lit_pixels": 0,
+    "black_screen_captures": 5,
+    "input_attempts": [
+      "Z",
+      "Enter",
+      "Down"
+    ],
+    "visible_game_response": false,
+    "visible_menu": false
+  },
+  "sekiro": {
+    "last_checkpoint_phase": "native_entry",
+    "last_checkpoint_outcome": "running",
+    "d3d11_devices": 0,
+    "d3d11_swap_chains": 0,
+    "successful_presents": 0,
+    "console_returned_to_dev_home": true,
+    "saved_worker_fault_available": false,
+    "visible_menu": false
+  }
+}

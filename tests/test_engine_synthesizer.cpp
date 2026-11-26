@@ -526,7 +526,7 @@ int main() {
     CHECK(trt_dynamic_deduce_return_val("kernel32.dll", "VirtualFree") == 1, "VirtualFree -> TRUE (1)");
   }
 
-  printf("== 11. Autonomous Runtime Provisioning & Unknown DLL Blanket ==\n");
+  printf("== 11. Runtime Provisioning & Provider Lookup ==\n");
   {
     trt_engine_profile test_prof;
     test_prof.game_name = "SyntheticGame";
@@ -538,8 +538,21 @@ int main() {
     int rc = trt_autonomous_provision_runtime(&be, &test_prof);
     CHECK(rc == 0, "trt_autonomous_provision_runtime succeeded");
 
-    CHECK(trt_module_route("unknown_physics_engine.dll") == TRT_ROUTE_STUB,
-          "unknown_physics_engine.dll auto-registered as TRT_ROUTE_STUB");    CHECK(trt_module_route("aksoundengine.dll") == TRT_ROUTE_BUILTIN,
+    static int host_symbol;
+    trt_set_system_loader(+[](const char* module, const char* symbol) -> void* {
+      if (symbol && strcmp(module, "unknown_physics_engine.dll") == 0 &&
+          strcmp(symbol, "Init") == 0)
+        return &host_symbol;
+      return nullptr;
+    });
+    trt_resolver resolver{};
+    trt_resolver_default(&resolver);
+    void* resolved = resolver.resolve(resolver.user, "unknown_physics_engine.dll", "Init", 0);
+    trt_set_system_loader(nullptr);
+    CHECK(resolved == &host_symbol, "the static binder can find an available host provider");
+    CHECK(trt_module_route("unknown_physics_engine.dll") == TRT_ROUTE_MISSING,
+          "an uncataloged import does not register a global placeholder");
+    CHECK(trt_module_route("aksoundengine.dll") == TRT_ROUTE_BUILTIN,
           "known Wwise module stays on the real bridge, never downgraded to STUB");
 
     // A BUILTIN route is not the same as a real implementation. These three
@@ -556,12 +569,10 @@ int main() {
               impl_cls == TRT_IMPL_NAMED_SILENT,
           "Miles fallback is classified NAMED_SILENT, not REAL");
 
-    CHECK(trt_module_route("my_custom_telemetry.dll") == TRT_ROUTE_STUB,
-          "my_custom_telemetry.dll auto-registered as TRT_ROUTE_STUB");
+    CHECK(trt_module_route("my_custom_telemetry.dll") == TRT_ROUTE_MISSING,
+          "an unavailable module stays missing");
 
-    // Provisioning must leave the real graphics/audio surfaces bound, not only
-    // the unknown-module blanket. These are the modules a synthesized profile
-    // selects before the guest maps its first import.
+    // These are the modules a profile can select before its imports bind.
     const char* kProvisionedModules[] = {
         "d3d11.dll", "d3d12.dll", "d3d9.dll", "vulkan-1.dll",
         "opengl32.dll", "xaudio2.dll", "fmod.dll", "dsound.dll",
@@ -571,10 +582,7 @@ int main() {
             "provisioning leaves the graphics/audio module bound");
     }
 
-    // Dynamic lookup remains honest; static import binding performs the
-    // blanket synthesis in pe_loader/x86_image, not in this resolver. The
-    // provisioned module above is deliberately STUB, so it resolves; a module
-    // that was never provisioned must still obey GetProcAddress(NULL).
+    // Dynamic lookup must still report missing modules and exports.
     CHECK(trt_resolve_module(nullptr, "never_provisioned_middleware.dll", "Init", 0) == nullptr,
           "unprovisioned module lookup stays NULL for GetProcAddress");
     CHECK(trt_resolve_module(nullptr, "aksoundengine.dll", "AK::SoundEngine::Init", 0) == nullptr,
@@ -615,7 +623,7 @@ int main() {
           "AdjustWindowRectEx -> TRUE (1)");
   }
 
-  printf("== 13. Ubiquitous Middleware Provisioning & Module Alias Tests ==\n");
+  printf("== 13. Middleware Routes & Module Alias Tests ==\n");
   {
     trt_engine_profile prof;
     prof.engine_type = TRT_ENGINE_UNIVERSAL;
@@ -623,15 +631,11 @@ int main() {
     prof.preferred_audio = TRT_AUDIO_WASAPI;
     trt_autonomous_provision_runtime(nullptr, &prof);
 
-    // Verify gaming middleware pre-registered as STUB
-    CHECK(trt_module_route("discord_game_sdk.dll") == TRT_ROUTE_STUB,
-          "discord_game_sdk.dll is provisioned as STUB");
-    CHECK(trt_module_route("eossdk-win64-shipping.dll") == TRT_ROUTE_STUB,
-          "eossdk-win64-shipping.dll is provisioned as STUB");
-    CHECK(trt_module_route("nvngx_dlss.dll") == TRT_ROUTE_STUB,
-          "nvngx_dlss.dll is provisioned as STUB");
-    CHECK(trt_module_route("sentry.dll") == TRT_ROUTE_STUB,
-          "sentry.dll is provisioned as STUB");
+    for (const char* module : {"discord_game_sdk.dll", "eossdk-win64-shipping.dll",
+                               "nvngx_dlss.dll", "sentry.dll"}) {
+      CHECK(trt_module_route(module) == TRT_ROUTE_MISSING,
+            "unimplemented middleware does not preempt a real provider");
+    }
 
     // Verify expanded Oodle, Bink, and Wwise built-in modules
     CHECK(trt_module_route("oo2core_9_win64.dll") == TRT_ROUTE_BUILTIN,
@@ -675,9 +679,8 @@ int main() {
     // UnityPlayer.dll exists physically on disk: MUST NOT be stubbed!
     CHECK(trt_module_route("unityplayer.dll") != TRT_ROUTE_STUB,
           "UnityPlayer.dll is preserved as native DLL and NOT stubbed out");
-    // missing_middleware.dll does NOT exist on disk: MUST be stubbed for fail-visibility!
-    CHECK(trt_module_route("missing_middleware.dll") == TRT_ROUTE_STUB,
-          "truly missing external module is auto-provisioned as STUB");
+    CHECK(trt_module_route("missing_middleware.dll") == TRT_ROUTE_MISSING,
+          "an unavailable external module stays missing");
   }
 
   printf("== 15. Payload Closure & Launch Preflight ==\n");
@@ -802,9 +805,11 @@ int main() {
     CHECK(has_resx && has_resy && has_windowed,
           "Unreal args carry -ResX/-ResY/-windowed");
 
-    std::string drive = "tests/out/test_synth_drive_c";
+    char drive_template[] = "tests/out/test_synth_drive_c_XXXXXX";
+    const char* drive = mkdtemp(drive_template);
+    CHECK(drive != nullptr, "created an isolated guest drive");
     char ini_path[1200] = {};
-    CHECK(trt_engine_write_user_settings(&ue, drive.c_str(), ini_path,
+    CHECK(trt_engine_write_user_settings(&ue, drive, ini_path,
                                          sizeof(ini_path)) == 1,
           "wrote the Unreal user settings file");
     CHECK(strstr(ini_path, "GameUserSettings.ini") != nullptr,
@@ -817,6 +822,18 @@ int main() {
           "settings file carries the synthesized resolution");
     CHECK(body.find("FullscreenMode=2") != std::string::npos,
           "settings file asks for windowed mode");
+
+    constexpr const char* saved = "[CustomSettings]\nSavedPreference=42\n";
+    {
+      std::ofstream settings(ini_path, std::ios::trunc);
+      settings << saved;
+      CHECK(settings.good(), "wrote the game's saved preferences");
+    }
+    CHECK(trt_engine_write_user_settings(&ue, drive, nullptr, 0) == 0,
+          "later Play preserves both existing Unreal settings files");
+    std::ifstream persisted(ini_path);
+    CHECK(std::string(std::istreambuf_iterator<char>(persisted), {}) == saved,
+          "later Play preserves the game's preferences byte for byte");
 
     // Unity: same screen on the command line, and TRT_SCREEN overrides it.
     std::string u_dir = "tests/out/test_synth_unity_screen";
@@ -849,7 +866,7 @@ int main() {
     unsetenv("TRT_SCREEN");
 
     char no_ini[256] = {};
-    CHECK(trt_engine_write_user_settings(&un2, drive.c_str(), no_ini,
+    CHECK(trt_engine_write_user_settings(&un2, drive, no_ini,
                                          sizeof(no_ini)) == 0,
           "no user-settings file is invented for an engine that has none");
   }

@@ -2358,12 +2358,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
            synth_prof.universal_flags);
   longan::log_line(synth_msg);
   if (synth_prof.engine_type == TRT_ENGINE_UNIVERSAL) {
-    // Universal: no engine evidence. What actually happens is the native guest
-    // path plus blanket stub provisioning for unknown imports (see
-    // trt_autonomous_provision_runtime); PC imports are translated, not
-    // recompiled, so say that instead of claiming a port that does not exist.
-    longan::log_line("host: universal engine -> native guest path with translated "
-                     "imports and blanket stubs (no engine-specific args applied)");
+    longan::log_line("host: universal engine uses the shared native guest path");
   }
   // Keep explicit title settings first, then the Steam launch command,
   // and use the generated engine defaults when neither specifies arguments.

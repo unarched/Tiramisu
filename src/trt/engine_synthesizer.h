@@ -162,11 +162,8 @@ bool trt_synthesize_engine(const char* game_dir, const char* target_exe_hint,
 bool trt_synthesize_engine_for_file(const char* exe_path,
                                     trt_engine_profile* out_profile);
 
-// Autonomous Runtime Provisioning:
-// Universal runtime wiring that provisions graphics bridges (D3D11, D3D12, Vulkan,
-// OpenGL, D3D9/8), audio middleware (XAudio2, FMOD, Wwise, OpenAL, DirectSound),
-// storage & video middleware (Bink, CriWare, Miles, Oodle, DStorage), and blanket-thunks
-// any uncataloged or third-party imported DLLs so games execute without per-game hacks.
+// Register the runtime's built-in bridges. The loader resolves other
+// imports against the mounted install and available system providers.
 int trt_autonomous_provision_runtime(const trt_backend* be, const trt_engine_profile* prof);
 
 // Launch preflight: resolve the synthesized profile against real host
@@ -182,13 +179,10 @@ int trt_engine_launch_preflight(const trt_engine_profile* prof,
 // Names the profile's chosen graphics API is expected to fail on this build.
 const char* trt_preflight_blocker_name(unsigned flag);
 
-// Write the engine's own settings file with the synthesized screen, so a title
-// does not boot at its 4K / 12 GB defaults inside a 5 GB Dev-Mode budget.
-// Implemented for Unreal (GameUserSettings.ini under the title's
-// Saved/Config/<platform>), which is the engine that reads it back on start.
-// `drive_c` is the host directory mounted as the guest's C:. Returns 1 when a
-// file was written (its host path lands in out_path), 0 when this engine has no
-// such file.
+// Seed missing Unreal GameUserSettings.ini files with the synthesized screen.
+// Existing files in Saved/Config/<platform> are preserved. drive_c is the
+// guest's mounted C: directory. Returns 1 and reports the last created file
+// in out_path when at least one file was created, or 0 otherwise.
 int trt_engine_write_user_settings(const trt_engine_profile* prof,
                                    const char* drive_c,
                                    char* out_path, size_t out_path_cap);

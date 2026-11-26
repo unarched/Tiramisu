@@ -34,7 +34,8 @@ namespace {
 
 std::string http_req(unsigned short port, const std::string& method,
                      const std::string& path, const std::string& body,
-                     const char* extra_hdrs = "") {
+                     const char* extra_hdrs = "",
+                     size_t declared_length = std::string::npos) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return {};
   sockaddr_in sa{};
@@ -46,12 +47,17 @@ std::string http_req(unsigned short port, const std::string& method,
     return {};
   }
 
+  std::string length_header;
+  if (!strstr(extra_hdrs, "Transfer-Encoding:")) {
+    const auto length = declared_length == std::string::npos ? body.size() : declared_length;
+    length_header = "Content-Length: " + std::to_string(length) + "\r\n";
+  }
   char hdr[1024];
   int hl = snprintf(hdr, sizeof(hdr),
                     "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%u\r\n"
-                    "Content-Length: %zu\r\n%sConnection: close\r\n\r\n",
-                    method.c_str(), path.c_str(), (unsigned)port, body.size(),
-                    extra_hdrs ? extra_hdrs : "");
+                    "%s%sConnection: close\r\n\r\n",
+                    method.c_str(), path.c_str(), (unsigned)port,
+                    length_header.c_str(), extra_hdrs);
   std::string req(hdr, (size_t)hl);
   if (!extra_hdrs || !strstr(extra_hdrs, "100-continue")) {
     req += body;
@@ -80,6 +86,7 @@ std::string http_req(unsigned short port, const std::string& method,
     }
   }
 
+  shutdown(fd, SHUT_WR);
   std::string resp;
   char buf[4096];
   ssize_t n;
@@ -190,6 +197,29 @@ int main() {
               read_str_file(root + "/games/HollowDemo/HollowDemo_Data/resources.assets") == asset_bytes,
           "Uploaded folder hierarchy & bytes persisted identically on disk");
     CHECK(longan::webxfer_poll_rescan(), "Folder upload flagged host rescan");
+
+    const std::string exe_route = "/api/upload-file?game=HollowDemo&rel=HollowDemo.exe";
+    const std::string exe_path = root + "/games/HollowDemo/HollowDemo.exe";
+    std::string partial = http_req(port, "PUT", exe_route, "partial", "", 12);
+    CHECK(partial.find("500 Server Error") != std::string::npos &&
+              read_str_file(exe_path) == exe_bytes,
+          "Disconnected replacement leaves the installed file intact");
+    constexpr const char* chunked = "Transfer-Encoding: chunked\r\n";
+    std::string malformed = http_req(port, "PUT", exe_route, "3\r\nnew!\n0\r\n\r\n", chunked);
+    CHECK(malformed.find("500 Server Error") != std::string::npos &&
+              read_str_file(exe_path) == exe_bytes,
+          "Malformed chunk framing leaves the installed file intact");
+    std::string truncated = http_req(port, "PUT", exe_route, "3\r\nnew\r\n0\r\n", chunked);
+    CHECK(truncated.find("500 Server Error") != std::string::npos &&
+              read_str_file(exe_path) == exe_bytes,
+          "Incomplete chunk terminator leaves the installed file intact");
+    std::string complete = http_req(port, "PUT", exe_route, "3\r\nnew\r\n0\r\n\r\n", chunked);
+    CHECK(complete.find("200 OK") != std::string::npos && read_str_file(exe_path) == "new",
+          "Complete chunked replacement publishes the new file");
+    std::string empty = http_req(port, "PUT", exe_route, "");
+    CHECK(empty.find("200 OK") != std::string::npos && file_exists(exe_path) &&
+              read_str_file(exe_path).empty(),
+          "A complete zero-byte upload replaces the old file");
   }
 
   // 6. .zip streaming upload + Expect: 100-continue + zip-slip protection

@@ -38,13 +38,13 @@
       "dir": "cuphead",
       "build": "Unity, D3D11",
       "machine": "PE32+ x64",
-      "boots": "yes — guest GPU work verified",
-      "renders": "**no visible game frame** — dark guest framebuffer on 0.2.4.47",
+      "boots": "guest entry and D3D11 reached on 0.2.4.48",
+      "renders": "**no visible game frame** — black guest framebuffer on 0.2.4.48",
       "audio": "not measured",
       "input": "game response unverified",
       "playable": "**no** — menu unreached",
       "evidence": [
-        "docs/proof/xbox-series-s-2026-11-26-launch-check.json"
+        "docs/proof/xbox-series-s-2026-11-26-integration-048.json"
       ]
     },
     {
@@ -52,13 +52,13 @@
       "dir": "sekiro",
       "build": "Windows PC",
       "machine": "PE32+ x64",
-      "boots": "guest entry invoked on 0.2.4.47",
-      "renders": "**no** — process exits before D3D11 initialization",
+      "boots": "guest entry invoked on 0.2.4.48",
+      "renders": "**no** — returned to Dev Home, D3D11 initialization unobserved",
       "audio": "not measured",
       "input": "not reached",
       "playable": "**no** — menu unreached",
       "evidence": [
-        "docs/proof/xbox-series-s-2026-11-26-launch-check.json"
+        "docs/proof/xbox-series-s-2026-11-26-integration-048.json"
       ]
     },
     {

@@ -85,6 +85,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1640,10 +1641,10 @@ bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
   return got == len;
 }
 
-uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
+bool stream_to_file(sock_t s, const char* pre, size_t pre_len,
                         const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
-  if (!f) return 0;
+  if (!f) return false;
   uint64_t got = 0;
   bool write_ok = true;
   if (pre && pre_len) {
@@ -1676,9 +1677,9 @@ uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
              "webxfer: upload write failed for %s (disk full or I/O error)",
              path);
     log_line(line);
-    return 0;  // caller removes the partial file + 500s
+    return false;  // caller removes the partial file + 500s
   }
-  if (got != len) return 0;  // short read (client disconnect); caller cleans up
+  if (got != len) return false;  // short read (client disconnect); caller cleans up
   // verify the bytes actually landed on disk before reporting success: a
   // truncated filesystem write must never come back ok:true
 #if defined(_WIN32)
@@ -1698,9 +1699,9 @@ uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
              (unsigned long long)len);
     log_line(line);
     remove(path);
-    return 0;
+    return false;
   }
-  return got;
+  return true;
 }
 
 bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
@@ -1717,25 +1718,45 @@ bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
     }
     return buf.size() >= need;
   };
+  constexpr size_t line_limit = 65536;
+  auto read_line = [&](std::string* line) {
+    size_t end = buf.find("\r\n");
+    while (end == std::string::npos && buf.size() <= line_limit) {
+      if (!ensure(buf.size() + 1)) return false;
+      end = buf.find("\r\n");
+    }
+    if (end > line_limit) return false;
+    line->assign(buf, 0, end);
+    buf.erase(0, end + 2);
+    return true;
+  };
   uint64_t written = 0;
   bool ok = true;
-  while (ok && !g_stop) {
-    size_t crlf = buf.find("\r\n");
-    while (crlf == std::string::npos) {
-      char tmp[4096];
-      int n = recv(s, tmp, sizeof(tmp), 0);
-      if (n <= 0) { ok = false; break; }
-      buf.append(tmp, (size_t)n);
-      crlf = buf.find("\r\n");
-      if (buf.size() > 65536 && crlf == std::string::npos) { ok = false; break; }
+  bool complete = false;
+  std::string line;
+  while (ok && !g_stop && read_line(&line)) {
+    const size_t extension = line.find(';');
+    if (extension != std::string::npos) {
+      line.resize(extension);
+      const size_t digits = line.find_last_not_of(" \t");
+      if (digits != std::string::npos) line.resize(digits + 1);
     }
-    if (!ok) break;
-    std::string line = buf.substr(0, crlf);
-    buf.erase(0, crlf + 2);
-    size_t semi = line.find(';');
-    if (semi != std::string::npos) line.resize(semi);
-    uint64_t csz = strtoull(line.c_str(), nullptr, 16);
-    if (csz == 0) break;
+    uint64_t csz = 0;
+    const char* end = line.data() + line.size();
+    const auto parsed = std::from_chars(line.data(), end, csz, 16);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) break;
+    if (csz == 0) {
+      size_t trailers_left = line_limit;
+      while (read_line(&line) && line.size() + 2 <= trailers_left) {
+        if (line.empty()) {
+          complete = true;
+          break;
+        }
+        if (line.find(':') == std::string::npos) break;
+        trailers_left -= line.size() + 2;
+      }
+      break;
+    }
     uint64_t rem = csz;
     while (rem > 0) {
       if (buf.empty() && !ensure(1)) { ok = false; break; }
@@ -1746,13 +1767,41 @@ bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
       written += take;
       g_upload_done += take;
     }
-    if (!ok || !ensure(2)) { ok = false; break; }
-    buf.erase(0, 2); // trailing CRLF
+    if (!ok || !ensure(2) || buf.compare(0, 2, "\r\n") != 0) break;
+    buf.erase(0, 2);
   }
-  if (fclose(f) != 0) ok = false;
+  if (fclose(f) != 0 || !complete) ok = false;
   if (!ok) remove(path);
   if (out_written) *out_written = written;
   return ok;
+}
+
+bool replace_uploaded_file(sock_t s, const char* pre, size_t pre_len,
+                           const std::string& out_path, bool is_chunked,
+                           uint64_t content_len, uint64_t* received) {
+  // Stage beside the destination so a disconnect leaves the installed file
+  // intact and the completed replacement can be published in one rename.
+  static std::atomic<uint64_t> upload_id{0};
+  const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto dir_end = out_path.rfind(XFER_SEP);
+  const std::string staged = out_path.substr(0, dir_end + 1) +
+      ".tiramisu-upload-" + std::to_string(stamp) + "-" +
+      std::to_string(upload_id.fetch_add(1));
+  *received = content_len;
+  const bool complete = is_chunked
+      ? stream_chunked_to_file(s, pre, pre_len, staged.c_str(), received)
+      : stream_to_file(s, pre, pre_len, staged.c_str(), content_len);
+  if (complete) {
+#if defined(_WIN32)
+    if (MoveFileExA(staged.c_str(), out_path.c_str(), MOVEFILE_REPLACE_EXISTING))
+      return true;
+#else
+    if (rename(staged.c_str(), out_path.c_str()) == 0) return true;
+#endif
+    log_line("webxfer: could not commit uploaded file");
+  }
+  remove(staged.c_str());
+  return false;
 }
 
 void set_upload_timeout(sock_t s) {
@@ -2619,8 +2668,8 @@ void handle_client(sock_t s) {
     if (is_chunked) {
       upload_ok = stream_chunked_to_file(s, pre, pre_len, tmp_zip.c_str(), &got);
     } else {
-      got = stream_to_file(s, pre, pre_len, tmp_zip.c_str(), content_len);
-      upload_ok = (got == content_len && got > 0);
+      got = content_len;
+      upload_ok = got > 0 && stream_to_file(s, pre, pre_len, tmp_zip.c_str(), got);
     }
     if (!upload_ok) {
       remove(tmp_zip.c_str());
@@ -2947,16 +2996,9 @@ void handle_client(sock_t s) {
     if (sl != std::string::npos) mkdirs(out_path.substr(0, sl));
     set_upload_label(game);
     uint64_t got = 0;
-    bool upload_ok = false;
-    if (is_chunked) {
-      upload_ok = stream_chunked_to_file(s, pre, pre_len, out_path.c_str(), &got);
-    } else {
-      g_upload_total += content_len;
-      got = stream_to_file(s, pre, pre_len, out_path.c_str(), content_len);
-      upload_ok = (got == content_len);
-    }
-    if (!upload_ok) {
-      remove(out_path.c_str());
+    if (!is_chunked) g_upload_total += content_len;
+    if (!replace_uploaded_file(s, pre, pre_len, out_path, is_chunked,
+                               content_len, &got)) {
       respond(s, "500 Server Error", "text/plain", "incomplete file");
       return;
     }
@@ -3012,8 +3054,8 @@ void handle_client(sock_t s) {
     if (is_chunked) {
       upload_ok = stream_chunked_to_file(s, pre, pre_len, tmp.c_str(), &got);
     } else {
-      got = stream_to_file(s, pre, pre_len, tmp.c_str(), content_len);
-      upload_ok = (got == content_len);
+      got = content_len;
+      upload_ok = stream_to_file(s, pre, pre_len, tmp.c_str(), got);
     }
     if (!upload_ok) {
       remove(tmp.c_str());

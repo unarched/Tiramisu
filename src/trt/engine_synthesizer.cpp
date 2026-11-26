@@ -1441,138 +1441,11 @@ int trt_autonomous_provision_runtime(const trt_backend* be, const trt_engine_pro
   trt_bridge_register_gdi();
   trt_bridge_register_version();
 
-  // 6. Pre-register ubiquitous third-party gaming middleware as STUB
-  //    so LoadLibrary succeeds with a synthetic handle and GetProcAddress
-  //    resolves via trt_dynamic_synthesize_api (never crashes at runtime)
-  static const char* const k_gaming_middleware[] = {
-      "discord_game_sdk.dll",
-      "discord-rpc.dll",
-      "eossdk-win64-shipping.dll",
-      "eossdk-win32-shipping.dll",
-      "eossdk.dll",
-      "galaxy64.dll",
-      "galaxy.dll",
-      "gfsdk_aftermath_lib.x64.dll",
-      "gfsdk_ssao_d3d11.win64.dll",
-      "gfsdk_txaa_alpharesolve.win64.dll",
-      "gfsdk_godrays_dx11.x64.dll",
-      "anselsdk64.dll",
-      "sl.interposer.dll",
-      "sl.dlss.dll",
-      "sl.common.dll",
-      "sl.reflex.dll",
-      "nvngx_dlss.dll",
-      "nvngx.dll",
-      "ffx_fsr2_api_dx12_x64.dll",
-      "ffx_fsr2_api_x64.dll",
-      "ffx_backend_dx12_x64.dll",
-      "libxess.dll",
-      "rzchromasdk64.dll",
-      "rzchromasdk.dll",
-      "cuesdk.x64_2015.dll",
-      "cuesdk_2015.dll",
-      "logitechgkey.dll",
-      "logitechled.dll",
-      "openvr_api.dll",
-      "openxr_loader.dll",
-      "sentry.dll",
-      "bugsplat64.dll",
-      "bugsplat.dll",
-      "breakpad_client.dll",
-      "vivoxcore.dll",
-      "ortp.dll",
-      "speex.dll",
-      "easyanticheat_x64.dll",
-      "beclient_x64.dll",
-  };
-  for (size_t i = 0; i < sizeof(k_gaming_middleware) / sizeof(k_gaming_middleware[0]); ++i) {
-    if (trt_module_route(k_gaming_middleware[i]) == TRT_ROUTE_MISSING) {
-      if (prof && !prof->game_dir.empty()) {
-        std::string p = path_join(prof->game_dir, k_gaming_middleware[i]);
-        if (file_exists(p)) continue;
-      }
-      trt_module_register(k_gaming_middleware[i], TRT_ROUTE_STUB, nullptr, 0);
-    }
-  }
-
   if (!prof) return 0;
-
-  // 6. Blanket unknown imported modules as STUB for fail-visible dynamic synthesis
-  for (const auto& mod : prof->imported_modules) {
-    if (mod.empty()) continue;
-    trt_route rt = trt_module_route(mod.c_str());
-    if (rt == TRT_ROUTE_MISSING) {
-      // Check if this module physically exists on disk in the game directory or exe dir.
-      // Game-shipped binaries (UnityPlayer.dll, GameAssembly.dll, mono-2.0-bdwgc.dll, etc.)
-      // must NEVER be blanketed as STUB, or their exports (UnityMain) will resolve to
-      // dummy no-ops that return 0 immediately instead of executing the game.
-      if (!prof->game_dir.empty()) {
-        std::string p1 = path_join(prof->game_dir, mod);
-        if (file_exists(p1) || file_exists(p1 + ".dll")) {
-          char msg[256];
-          snprintf(msg, sizeof(msg),
-                   "trt: [AUTONOMOUS SYNTHESIS] preserving native game DLL %s (found in game dir)",
-                   mod.c_str());
-          trt_core_log(msg);
-          continue;
-        }
-      }
-      if (!prof->main_exe_abs.empty()) {
-        size_t sl = prof->main_exe_abs.find_last_of("/\\");
-        if (sl != std::string::npos) {
-          std::string exe_parent = prof->main_exe_abs.substr(0, sl);
-          std::string p2 = path_join(exe_parent, mod);
-          if (file_exists(p2) || file_exists(p2 + ".dll")) {
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                     "trt: [AUTONOMOUS SYNTHESIS] preserving native game DLL %s (found in exe dir)",
-                     mod.c_str());
-            trt_core_log(msg);
-            continue;
-          }
-        }
-      }
-#ifndef _WIN32
-      if (!prof->game_dir.empty()) {
-        std::string m_low = lower_str(mod);
-        std::string m_low_dll = (m_low.size() >= 4 && m_low.substr(m_low.size() - 4) == ".dll")
-                                    ? m_low
-                                    : (m_low + ".dll");
-        DIR* d = opendir(prof->game_dir.c_str());
-        if (d) {
-          bool found = false;
-          struct dirent* de;
-          while ((de = readdir(d)) != nullptr) {
-            std::string fn = lower_str(de->d_name);
-            if (fn == m_low || fn == m_low_dll) {
-              found = true;
-              break;
-            }
-          }
-          closedir(d);
-          if (found) {
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                     "trt: [AUTONOMOUS SYNTHESIS] preserving native game DLL %s (found in dir ci)",
-                     mod.c_str());
-            trt_core_log(msg);
-            continue;
-          }
-        }
-      }
-#endif
-      trt_module_register(mod.c_str(), TRT_ROUTE_STUB, nullptr, 0);
-      char msg[256];
-      snprintf(msg, sizeof(msg),
-               "trt: [AUTONOMOUS SYNTHESIS] auto-provisioned blanket stub module %s",
-               mod.c_str());
-      trt_core_log(msg);
-    }
-  }
 
   char log_buf[512];
   snprintf(log_buf, sizeof(log_buf),
-           "trt: [AUTONOMOUS SYNTHESIS] provisioned runtime for %s (engine=%s, gfx=%s, audio=%s)",
+           "trt: [ENGINE SYNTHESIZER] registered built-in routes for %s (engine=%s, gfx=%s, audio=%s)",
            prof->game_name.empty() ? "<unknown>" : prof->game_name.c_str(),
            trt_engine_type_name(prof->engine_type),
            trt_graphics_api_name(prof->preferred_gfx),
@@ -1612,21 +1485,25 @@ extern "C" int trt_engine_write_user_settings(const trt_engine_profile* prof,
     dir = path_join(dir, plat);
     if (!make_dirs(dir)) continue;
     const std::string file = path_join(dir, "GameUserSettings.ini");
-    FILE* f = fopen(file.c_str(), "w");
+    // Seed defaults on first launch. The game owns the file from then on.
+    FILE* f = fopen(file.c_str(), "wx");
     if (!f) continue;
     const int w = prof->screen_width;
     const int h = prof->screen_height;
     const int mode = prof->fullscreen ? 0 : 2;  // 0 = fullscreen, 2 = windowed
-    fprintf(f, "[/Script/Engine.GameUserSettings]\n");
-    fprintf(f, "bUseVSync=False\n");
-    fprintf(f, "ResolutionSizeX=%d\n", w);
-    fprintf(f, "ResolutionSizeY=%d\n", h);
-    fprintf(f, "LastUserConfirmedResolutionSizeX=%d\n", w);
-    fprintf(f, "LastUserConfirmedResolutionSizeY=%d\n", h);
-    fprintf(f, "WindowPosX=-1\nWindowPosY=-1\n");
-    fprintf(f, "FullscreenMode=%d\nLastConfirmedFullscreenMode=%d\n", mode, mode);
-    fprintf(f, "PreferredFullscreenMode=%d\nVersion=5\n", mode);
-    fclose(f);
+    const int printed = fprintf(f,
+        "[/Script/Engine.GameUserSettings]\n"
+        "bUseVSync=False\n"
+        "ResolutionSizeX=%d\nResolutionSizeY=%d\n"
+        "LastUserConfirmedResolutionSizeX=%d\nLastUserConfirmedResolutionSizeY=%d\n"
+        "WindowPosX=-1\nWindowPosY=-1\n"
+        "FullscreenMode=%d\nLastConfirmedFullscreenMode=%d\n"
+        "PreferredFullscreenMode=%d\nVersion=5\n",
+        w, h, w, h, mode, mode, mode);
+    if (fclose(f) != 0 || printed < 0) {
+      remove(file.c_str());
+      continue;
+    }
     if (out_path && out_path_cap) snprintf(out_path, out_path_cap, "%s", file.c_str());
     ++wrote;
   }
@@ -1780,10 +1657,8 @@ extern "C" int trt_engine_launch_preflight(const trt_engine_profile* prof,
   if (prof->is_pe32)
     note("PE32: runs on the x86 engine, whose 3D surface is the translated path only");
 
-  // 5. Anti-cheat and stub-serviced imports. Only an explicitly registered
-  //    STUB counts: a route that is merely MISSING is registered later in the
-  //    launch (or is the game's own DLL), and counting it produced false
-  //    "stub" notes for unityplayer.dll and system modules.
+  // 5. Anti-cheat and known stub routes. A missing route can still resolve
+  //    through the guest's own DLLs or an available host provider.
   std::vector<std::string> ac, stub_core;
   auto on_disk = [&](const std::string& m) {
     for (const std::string* dir : {&prof->game_dir}) {
