@@ -1449,8 +1449,10 @@ void rescan_games_root_only() {
       snapshot_prev_choice();
   // Preserve removable-drive entries while refreshing all configured roots.
   const auto under_root = [](const std::string& path, const std::string& root) {
-    return !root.empty() &&
-           _strnicmp(path.c_str(), root.c_str(), root.size()) == 0;
+    if (root.empty() || path.size() < root.size() ||
+        _strnicmp(path.c_str(), root.c_str(), root.size()) != 0) return false;
+    if (path.size() == root.size() || root.back() == '\\' || root.back() == '/') return true;
+    return path[root.size()] == '\\' || path[root.size()] == '/';
   };
   std::vector<game_entry> external_games;
   for (auto& ge : g_games) {

@@ -333,6 +333,34 @@ int main() {
               g3.find("\"log_lines\":4") != std::string::npos,
           "POST /api/settings clamps out-of-range values");
 
+    const auto stable_ini = read_str_file(root + "/settings.ini");
+    std::string nested = http_req(port, "POST", "/api/settings",
+                                  R"({"metadata":{"mouse_speed":21}})");
+    std::string trailing = http_req(port, "POST", "/api/settings",
+                                    R"({"mouse_speed":21} [])");
+    std::string invalid_text = http_req(port, "POST", "/api/settings",
+                                        R"({"default_input":"auto\n"})");
+    CHECK(nested.find("400 Bad Request") != std::string::npos &&
+              trailing.find("400 Bad Request") != std::string::npos &&
+              invalid_text.find("400 Bad Request") != std::string::npos &&
+              read_str_file(root + "/settings.ini") == stable_ini,
+          "Invalid settings objects do not alter saved settings");
+
+    std::string wrong_type = http_req(port, "POST", "/api/settings",
+                                      R"({"default_input":false,"note":"auto","mouse_speed":72.5})");
+    std::string after_wrong = http_req(port, "GET", "/api/settings", "");
+    CHECK(wrong_type.find("200 OK") != std::string::npos &&
+              after_wrong.find("\"default_input\":\"pad2kbm\"") != std::string::npos &&
+              after_wrong.find("\"mouse_speed\":100") != std::string::npos,
+          "A different JSON type does not overwrite a typed setting");
+
+    std::string escaped = http_req(port, "POST", "/api/settings",
+                                   R"({"default_input":"\u0061uto"})");
+    std::string after_escape = http_req(port, "GET", "/api/settings", "");
+    CHECK(escaped.find("200 OK") != std::string::npos &&
+              after_escape.find("\"default_input\":\"auto\"") != std::string::npos,
+          "JSON string escapes round-trip through the settings endpoint");
+
     // dashboard page carries the settings, connect, saves backup/debug & mobile folder guidance
     std::string page = http_req(port, "GET", "/", "");
     CHECK(page.find("200 OK") != std::string::npos &&

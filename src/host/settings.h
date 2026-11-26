@@ -10,6 +10,7 @@
 #define TIRAMISU_SETTINGS_H
 
 #include <string>
+#include <string_view>
 
 namespace longan {
 
@@ -89,6 +90,10 @@ int settings_write_profile_stub(const std::string& dir,
 // are known). Pure: used by the host log line and by the offline tests.
 int settings_unknown_services(const std::string& list,
                               std::string* unknown = nullptr);
+// Flat JSON settings exchanged by the transfer dashboard.
+std::string dashboard_settings_json(const host_settings& settings);
+bool apply_dashboard_settings(std::string_view input, host_settings& settings);
+
 // Persist global defaults and recompute the effective launch settings.
 bool settings_store(const host_settings& s, const std::string& local_state);
 host_settings settings_get_global();

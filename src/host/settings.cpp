@@ -4,6 +4,7 @@
 #include "../trt/trt.h"
 
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -37,6 +38,190 @@ const char k_sep = '/';  // offline-test path (Linux)
 #endif
 
 int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// One list drives both dashboard reads and writes, so a visible setting
+// cannot quietly disappear from one side of the HTTP API.
+template <typename T>
+struct dashboard_setting {
+  const char* key;
+  T host_settings::*member;
+};
+constexpr dashboard_setting<bool> dashboard_flags[] = {
+    {"pad_vibration", &host_settings::pad_vibration},
+    {"win11_personality", &host_settings::win11_personality},
+    {"write_watch", &host_settings::write_watch},
+    {"steam_auth", &host_settings::steam_auth},
+    {"show_qr", &host_settings::show_qr},
+    {"show_fps", &host_settings::show_fps},
+    {"show_sysinfo", &host_settings::show_sysinfo},
+    {"quick_menu_enabled", &host_settings::quick_menu_enabled},
+    {"vsync", &host_settings::vsync},
+    {"shader_cache", &host_settings::shader_cache},
+    {"fsb_decode", &host_settings::fsb_decode},
+};
+constexpr dashboard_setting<int> dashboard_numbers[] = {
+    {"mouse_speed", &host_settings::mouse_speed},
+    {"wheel_speed", &host_settings::wheel_speed},
+    {"os_major", &host_settings::os_major},
+    {"os_minor", &host_settings::os_minor},
+    {"os_build", &host_settings::os_build},
+    {"log_lines", &host_settings::log_lines},
+    {"frame_rate_cap", &host_settings::frame_rate_cap},
+    {"resolution_scale", &host_settings::resolution_scale},
+    {"memory_budget_mb", &host_settings::memory_budget_mb},
+    {"input_deadzone", &host_settings::input_deadzone},
+    {"audio_buffer_ms", &host_settings::audio_buffer_ms},
+    {"texture_quality", &host_settings::texture_quality},
+};
+constexpr dashboard_setting<std::string> dashboard_text[] = {
+    {"default_input", &host_settings::default_input},
+    {"network_games_root", &host_settings::network_games_root},
+};
+
+void skip_json_space(std::string_view& input) {
+  const auto first = input.find_first_not_of(" \t\r\n");
+  input.remove_prefix(first == std::string_view::npos ? input.size() : first);
+}
+
+bool take_json(std::string_view& input, char expected) {
+  skip_json_space(input);
+  if (input.empty() || input.front() != expected) return false;
+  input.remove_prefix(1);
+  return true;
+}
+
+bool read_json_hex(std::string_view& input, uint32_t& value) {
+  if (input.size() < 4) return false;
+  value = 0;
+  for (char c : input.substr(0, 4)) {
+    if (c >= '0' && c <= '9') value = value * 16 + (c - '0');
+    else if (c >= 'a' && c <= 'f') value = value * 16 + (c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') value = value * 16 + (c - 'A' + 10);
+    else return false;
+  }
+  input.remove_prefix(4);
+  return true;
+}
+
+bool read_json_unicode(std::string_view& input, std::string& text) {
+  uint32_t code;
+  if (!read_json_hex(input, code)) return false;
+  if (code >= 0xD800 && code <= 0xDBFF) {
+    if (!input.starts_with("\\u")) return false;
+    input.remove_prefix(2);
+    uint32_t low;
+    if (!read_json_hex(input, low) || low < 0xDC00 || low > 0xDFFF) return false;
+    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+  } else if (code >= 0xDC00 && code <= 0xDFFF) {
+    return false;
+  }
+
+  if (code < 0x80) {
+    text.push_back(static_cast<char>(code));
+    return true;
+  }
+  const int extra = code < 0x800 ? 1 : code < 0x10000 ? 2 : 3;
+  const unsigned prefix[] = {0, 0xC0, 0xE0, 0xF0};
+  text.push_back(static_cast<char>(prefix[extra] | (code >> (6 * extra))));
+  for (int n = extra - 1; n >= 0; --n)
+    text.push_back(static_cast<char>(0x80 | ((code >> (6 * n)) & 0x3F)));
+  return true;
+}
+
+bool read_json_string(std::string_view& input, std::string& text) {
+  if (!take_json(input, '"')) return false;
+  text.clear();
+  while (!input.empty()) {
+    const unsigned char c = input.front();
+    input.remove_prefix(1);
+    if (c == '"') return true;
+    if (c < 0x20) return false;
+    if (c != '\\') {
+      text.push_back(static_cast<char>(c));
+      continue;
+    }
+    if (input.empty()) return false;
+    const char escaped = input.front();
+    input.remove_prefix(1);
+    switch (escaped) {
+      case '"': case '\\': case '/': text.push_back(escaped); break;
+      case 'b': text.push_back('\b'); break;
+      case 'f': text.push_back('\f'); break;
+      case 'n': text.push_back('\n'); break;
+      case 'r': text.push_back('\r'); break;
+      case 't': text.push_back('\t'); break;
+      case 'u': if (!read_json_unicode(input, text)) return false; break;
+      default: return false;
+    }
+  }
+  return false;
+}
+
+std::string quote_dashboard_string(std::string_view value) {
+  std::string json = "\"";
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') json += '\\';
+    if (c < 0x20) {
+      char escaped[7];
+      snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned>(c));
+      json += escaped;
+    } else {
+      json += static_cast<char>(c);
+    }
+  }
+  return json + '"';
+}
+
+template <typename T, size_t N>
+bool assign_dashboard_value(host_settings& settings, std::string_view key,
+                            const T& value, const dashboard_setting<T> (&entries)[N]) {
+  for (const auto& entry : entries) {
+    if (key == entry.key) {
+      settings.*entry.member = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool valid_ini_text(std::string_view text) {
+  return text.find_first_of("\r\n") == std::string_view::npos &&
+         text.find('\0') == std::string_view::npos;
+}
+
+bool read_dashboard_number(std::string_view token, int& value, bool& integer) {
+  // The dashboard uses integers. Accept valid decimal and exponent syntax
+  // without applying those values to integer settings.
+  const auto end_integer = token.find_first_of(".eE");
+  const auto integer_token = token.substr(0, end_integer);
+  const bool negative = integer_token.starts_with('-');
+  auto digits = integer_token.substr(negative ? 1 : 0);
+  if (digits.empty() || (digits.front() == '0' && digits.size() > 1) ||
+      digits.find_first_not_of("0123456789") != std::string_view::npos) return false;
+  integer = end_integer == std::string_view::npos;
+  if (integer) {
+    int raw = 0;
+    const auto result = std::from_chars(integer_token.data(),
+                                        integer_token.data() + integer_token.size(), raw);
+    value = result.ec == std::errc::result_out_of_range
+        ? (negative ? -100000 : 100000) : clampi(raw, -100000, 100000);
+    return true;
+  }
+
+  auto suffix = token.substr(end_integer);
+  if (suffix.front() == '.') {
+    suffix.remove_prefix(1);
+    const auto count = suffix.find_first_not_of("0123456789");
+    if (count == 0 || suffix.empty()) return false;
+    if (count == std::string_view::npos) return true;
+    suffix.remove_prefix(count);
+  }
+  if (suffix.empty() || (suffix.front() != 'e' && suffix.front() != 'E')) return false;
+  suffix.remove_prefix(1);
+  if (!suffix.empty() && (suffix.front() == '+' || suffix.front() == '-'))
+    suffix.remove_prefix(1);
+  return !suffix.empty() && suffix.find_first_not_of("0123456789") == std::string_view::npos;
+}
 
 std::string trim(const std::string& s) {
   size_t a = 0, b = s.size();
@@ -436,13 +621,65 @@ int settings_write_profile_stub(const std::string& dir,
   return write_ini_atomic(path, text) ? 1 : -1;
 }
 
+std::string dashboard_settings_json(const host_settings& settings) {
+  std::string json = "{";
+  auto add = [&](const char* key, const std::string& encoded) {
+    if (json.size() > 1) json += ',';
+    json += '"';
+    json += key;
+    json += "\":";
+    json += encoded;
+  };
+  for (const auto& entry : dashboard_flags)
+    add(entry.key, settings.*entry.member ? "true" : "false");
+  for (const auto& entry : dashboard_numbers)
+    add(entry.key, std::to_string(settings.*entry.member));
+  for (const auto& entry : dashboard_text)
+    add(entry.key, quote_dashboard_string(settings.*entry.member));
+  return json + '}';
+}
+
+bool apply_dashboard_settings(std::string_view input, host_settings& settings) {
+  if (!take_json(input, '{')) return false;
+  host_settings updated = settings;
+  if (!take_json(input, '}')) {
+    do {
+      std::string key;
+      if (!read_json_string(input, key) || !take_json(input, ':')) return false;
+      skip_json_space(input);
+      if (input.empty()) return false;
+      if (input.front() == '"') {
+        std::string text;
+        if (!read_json_string(input, text)) return false;
+        if (assign_dashboard_value(updated, key, text, dashboard_text) &&
+            !valid_ini_text(text)) return false;
+      } else {
+        const auto token = input.substr(0, input.find_first_of(" \t\r\n,}"));
+        if (token == "true" || token == "false") {
+          assign_dashboard_value(updated, key, token == "true", dashboard_flags);
+        } else if (token != "null") {
+          int number;
+          bool integer;
+          if (!read_dashboard_number(token, number, integer)) return false;
+          if (integer) assign_dashboard_value(updated, key, number, dashboard_numbers);
+        }
+        input.remove_prefix(token.size());
+      }
+    } while (take_json(input, ','));
+    if (!take_json(input, '}')) return false;
+  }
+  skip_json_space(input);
+  if (!input.empty()) return false;
+  settings = std::move(updated);
+  return true;
+}
+
 bool settings_store(const host_settings& s, const std::string& local_state) {
   std::lock_guard<std::mutex> lock(g_mu);
   // Persist the same bounded values a reload would produce. One validation
   // path covers settings entered in the TV UI, web UI, and INI file.
-  for (const auto* text : {&s.launch_args, &s.required_services, &s.network_games_root})
-    if (text->find_first_of("\r\n") != std::string::npos ||
-        text->find('\0') != std::string::npos) return false;
+  for (const auto* text : {&s.default_input, &s.launch_args, &s.required_services, &s.network_games_root})
+    if (!valid_ini_text(*text)) return false;
   host_settings c;
   c.apply_ini(s.to_ini());
   if (!write_ini_atomic(local_state + k_sep + "settings.ini", c.to_ini()))

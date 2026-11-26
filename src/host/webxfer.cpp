@@ -1277,93 +1277,6 @@ bool parse_json_str_field(const std::string& json, const char* key, std::string*
   return false;
 }
 
-// One list drives both dashboard reads and writes, so a visible setting
-// cannot quietly disappear from one side of the HTTP API.
-template <typename T>
-struct dashboard_setting {
-  const char* key;
-  T host_settings::*member;
-};
-constexpr dashboard_setting<bool> dashboard_flags[] = {
-    {"pad_vibration", &host_settings::pad_vibration},
-    {"win11_personality", &host_settings::win11_personality},
-    {"write_watch", &host_settings::write_watch},
-    {"steam_auth", &host_settings::steam_auth},
-    {"show_qr", &host_settings::show_qr},
-    {"show_fps", &host_settings::show_fps},
-    {"show_sysinfo", &host_settings::show_sysinfo},
-    {"quick_menu_enabled", &host_settings::quick_menu_enabled},
-    {"vsync", &host_settings::vsync},
-    {"shader_cache", &host_settings::shader_cache},
-    {"fsb_decode", &host_settings::fsb_decode},
-};
-constexpr dashboard_setting<int> dashboard_numbers[] = {
-    {"mouse_speed", &host_settings::mouse_speed},
-    {"wheel_speed", &host_settings::wheel_speed},
-    {"os_major", &host_settings::os_major},
-    {"os_minor", &host_settings::os_minor},
-    {"os_build", &host_settings::os_build},
-    {"log_lines", &host_settings::log_lines},
-    {"frame_rate_cap", &host_settings::frame_rate_cap},
-    {"resolution_scale", &host_settings::resolution_scale},
-    {"memory_budget_mb", &host_settings::memory_budget_mb},
-    {"input_deadzone", &host_settings::input_deadzone},
-    {"audio_buffer_ms", &host_settings::audio_buffer_ms},
-    {"texture_quality", &host_settings::texture_quality},
-};
-constexpr dashboard_setting<std::string> dashboard_text[] = {
-    {"default_input", &host_settings::default_input},
-    {"network_games_root", &host_settings::network_games_root},
-};
-
-std::string dashboard_settings_json(const host_settings& settings) {
-  std::string json = "{";
-  auto add = [&](const char* key, const std::string& encoded) {
-    if (json.size() > 1) json += ',';
-    json += '"';
-    json += key;
-    json += "\":";
-    json += encoded;
-  };
-  for (const auto& entry : dashboard_flags)
-    add(entry.key, settings.*entry.member ? "true" : "false");
-  for (const auto& entry : dashboard_numbers)
-    add(entry.key, std::to_string(settings.*entry.member));
-  for (const auto& entry : dashboard_text)
-    add(entry.key, '"' + json_escape(settings.*entry.member) + '"');
-  return json + '}';
-}
-
-void apply_dashboard_settings(const std::string& body, host_settings& settings) {
-  auto value = [&](const char* key) -> const char* {
-    const std::string name = std::string("\"") + key + '"';
-    const auto pos = body.find(name);
-    if (pos == std::string::npos) return "";
-    const auto colon = body.find_first_not_of(" \t\r\n", pos + name.size());
-    if (colon == std::string::npos || body[colon] != ':') return "";
-    const auto start = body.find_first_not_of(" \t\r\n", colon + 1);
-    return start == std::string::npos ? "" : body.c_str() + start;
-  };
-  auto ends_value = [](char c) {
-    return c == ',' || c == '}' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
-  };
-  for (const auto& entry : dashboard_flags) {
-    const char* raw = value(entry.key);
-    if (strncmp(raw, "true", 4) == 0 && ends_value(raw[4])) settings.*entry.member = true;
-    else if (strncmp(raw, "false", 5) == 0 && ends_value(raw[5])) settings.*entry.member = false;
-  }
-  for (const auto& entry : dashboard_numbers) {
-    const char* raw = value(entry.key);
-    char* end = nullptr;
-    const long parsed = strtol(raw, &end, 10);
-    if (end != raw && ends_value(*end))
-      settings.*entry.member = static_cast<int>(std::clamp(parsed, -100000L, 100000L));
-  }
-  for (const auto& entry : dashboard_text)
-    parse_json_str_field(body, entry.key, &(settings.*entry.member));
-}
-
-
 std::string games_json() {
   const auto roots = game_roots();
   const std::string sep(1, XFER_SEP);
@@ -3176,7 +3089,10 @@ void handle_client(sock_t s) {
     }
     auto st = settings_get_global();
     const auto previous_network_root = st.network_games_root;
-    apply_dashboard_settings(body, st);
+    if (!apply_dashboard_settings(body, st)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid settings object");
+      return;
+    }
     if (!settings_store(st, g_local_state_dir)) {
       respond(s, "500 Server Error", "text/plain", "Could not save settings");
       return;
