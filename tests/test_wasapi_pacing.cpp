@@ -26,6 +26,7 @@
 #include "../src/trt/trt.h"
 #include "../src/trt/bridge_wasapi.h"
 
+#include <atomic>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,15 +96,12 @@ void linux_release(void* base, size_t bytes) {
   (void)bytes;
 }
 
-// Named-line capture for the huge-malloc probe check.
-char g_log_lines[256][128];
-int g_log_count = 0;
+std::atomic<bool> g_large_allocation_logged{false};
+
 void linux_log(const char* line) {
   printf("  [trt] %s\n", line);
-  if (g_log_count < 256) {
-    strncpy(g_log_lines[g_log_count], line, 127);
-    g_log_lines[g_log_count][127] = 0;
-    ++g_log_count;
+  if (strstr(line, "msvcrt: malloc(sz=1073741824) -> NULL")) {
+    g_large_allocation_logged.store(true, std::memory_order_relaxed);
   }
 }
 
@@ -347,12 +345,11 @@ int main() {
     if (pm) {
       void* small = pm(1024);
       CHECK(small != nullptr, "malloc(1024) succeeds");
+      g_large_allocation_logged.store(false, std::memory_order_relaxed);
       void* huge = pm(1073741824u /*1 GB, absurd for a game alloc*/);
       CHECK(huge == nullptr, "malloc(1GB) refused -> NULL (fail-visible)");
-      int named = 0;
-      for (int i = 0; i < g_log_count; ++i)
-        if (strstr(g_log_lines[i], "msvcrt: malloc(sz=")) named = 1;
-      CHECK(named, "the refused allocation is named in the log");
+      CHECK(g_large_allocation_logged.load(std::memory_order_relaxed),
+            "the refused allocation is named in the log");
     }
   }
 
