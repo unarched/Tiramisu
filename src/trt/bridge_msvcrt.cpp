@@ -1423,18 +1423,21 @@ i32 TRT_GUEST_ABI crt__write(i32 gfd, const void* buf, u32 cnt) {
 #endif
 }
 i64 TRT_GUEST_ABI crt__lseeki64(i32 gfd, i64 off, i32 origin) {
-  int hfd = host_fd_of(gfd);
-  if (hfd < 0) return -1;
+  const int hfd = host_fd_of(gfd);
+  if (hfd < 0) {
+    set_errno_from_host(EBADF);
+    return -1;
+  }
 #ifdef _WIN32
-  return _lseeki64(hfd, off, origin);
+  const i64 offset = _lseeki64(hfd, off, origin);
 #else
-  return (i64)lseek(hfd, (off_t)off, origin);
+  const i64 offset = (i64)lseek(hfd, (off_t)off, origin);
 #endif
+  if (offset < 0) set_errno_from_host(errno);
+  return offset;
 }
 i64 TRT_GUEST_ABI crt__telli64(i32 gfd) {
-  const i64 offset = crt__lseeki64(gfd, 0, SEEK_CUR);
-  if (offset < 0) set_errno_from_host(errno ? errno : EBADF);
-  return offset;
+  return crt__lseeki64(gfd, 0, SEEK_CUR);
 }
 i64 TRT_GUEST_ABI crt__filelengthi64(i32 gfd) {
   int hfd = host_fd_of(gfd);

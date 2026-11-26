@@ -70,7 +70,10 @@ int main() {
   u16 wide[4]{};
   CHECK(error_a && error_a(2, ascii, sizeof(ascii)) == 0 &&
         strcmp(ascii, "Invalid device ID.") == 0, "MIDI device error has an ANSI message");
-  CHECK(error_w && error_w(4, wide, 4) == 0 && wide[0] == 'I' && wide[3] == 0,
+  CHECK(error_a && error_a(4, ascii, sizeof(ascii)) == 0 &&
+        strcmp(ascii, "Device already allocated.") == 0,
+        "MIDI allocated-device and invalid-handle codes are distinct");
+  CHECK(error_w && error_w(5, wide, 4) == 0 && wide[0] == 'I' && wide[3] == 0,
         "MIDI error text truncates and terminates a UTF-16 buffer");
   CHECK(error_a && error_a(999, ascii, sizeof(ascii)) == 9,
         "MIDI rejects unknown error numbers");

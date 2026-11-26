@@ -491,6 +491,11 @@ void test_wave2c_vfs_cow() {
   CHECK(fd >= 0 && tell && read_bytes && read_bytes(fd, &first, 1) == 1 &&
         first == 'R' && tell(fd) == 1, "CRT _telli64 uses the guest descriptor");
   if (stream && close_file) close_file(stream);
+  using GuestErrno = i32* (TRT_GUEST_ABI*)();
+  auto guest_errno = reinterpret_cast<GuestErrno>(crt("_errno"));
+  errno = EACCES;
+  CHECK(tell && guest_errno && tell(-1) == -1 && *guest_errno() == EBADF,
+        "CRT _telli64 reports EBADF independently of the previous host errno");
 
   using SetDirW_t = int (TRT_STDCALL *)(const u16*);
   using GetDirW_t = u32 (TRT_STDCALL *)(u32, u16*);

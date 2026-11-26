@@ -775,9 +775,35 @@ namespace {
 const char* midi_error_text(u32 error) {
   switch (error) {
     case 0: return "No error.";
+    case 1: return "Unspecified multimedia error.";
     case 2: return "Invalid device ID.";
-    case 4: return "Invalid device handle.";
+    case 3: return "Device driver is disabled.";
+    case 4: return "Device already allocated.";
+    case 5: return "Invalid device handle.";
+    case 6: return "No device driver.";
+    case 7: return "Not enough memory.";
+    case 8: return "Function is not supported.";
+    case 9: return "Error number is out of range.";
+    case 10: return "Invalid flag.";
     case 11: return "Invalid parameter.";
+    case 12: return "Device handle is busy.";
+    case 13: return "Device alias was not found.";
+    case 14: return "Invalid multimedia registry database.";
+    case 15: return "Registry key was not found.";
+    case 16: return "Registry read failed.";
+    case 17: return "Registry write failed.";
+    case 18: return "Registry deletion failed.";
+    case 19: return "Registry value was not found.";
+    case 20: return "Device driver did not call DriverCallback.";
+    case 21: return "More data is available.";
+    case 64: return "MIDI header is not prepared.";
+    case 65: return "MIDI playback is still in progress.";
+    case 66: return "No MIDI instruments are configured.";
+    case 67: return "MIDI device is busy.";
+    case 68: return "MIDI port is disconnected.";
+    case 69: return "Invalid MIDI setup.";
+    case 70: return "Operation is unsupported in the current MIDI open mode.";
+    case 71: return "MIDI Thru device consumed the message.";
     default: return nullptr;
   }
 }
