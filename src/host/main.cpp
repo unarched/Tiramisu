@@ -42,6 +42,7 @@
 #include "../trt/bridge_fmod_studio.h"
 #include "../trt/bridge_steam.h"
 #include "steam_client.h"
+#include "steam_install.h"
 #include "../trt/spirv_hlsl.h"
 #include "console_detect.h"
 #include "../trt/bridge_esram.h"
@@ -133,7 +134,12 @@ std::thread g_guest_thread;
 std::string g_running_game_name;  // guest currently running ("" when idle) — heartbeat + logs
 ULONGLONG g_boot_ms = 0;          // GetTickCount64 at Run() start — heartbeat uptime
 ULONGLONG g_last_rescan_ms = 0;   // GetTickCount64 of the last shelf rescan — debounce clock
-std::string g_pending_launch;
+struct pending_launch_request {
+  std::string name;
+  std::string directory;  // Steam launches match the validated install path.
+  std::string executable;
+};
+pending_launch_request g_pending_launch;
 
 // In-console autopilot state owned by the host loop (see host_autopilot.h).
 // webxfer arms it on transfer; the launch handoff and its result drive the
@@ -1000,8 +1006,9 @@ void scan_game_entry(
     return;
   }
   const std::string gdir = root + "\\" + n;
-  if (GetFileAttributesA((gdir + longan::kSteamInstallPending).c_str()) !=
-      INVALID_FILE_ATTRIBUTES) return;
+  const auto steam_install = longan::inspect_steam_install(gdir);
+  if (steam_install.state == longan::steam_install_state::incomplete ||
+      steam_install.state == longan::steam_install_state::missing_executable) return;
   std::string disp = n;
   bool dup = false;
   for (const auto& existing : g_games) {
@@ -1021,7 +1028,7 @@ void scan_game_entry(
   // when the folder has no runnable exe, or when the image's best exe outscores
   // the folder's (a bundled installer or launcher must not beat the real game).
   std::string image_path;
-  {
+  if (steam_install.state != longan::steam_install_state::ready) {
     char img[1024] = {};
     if (trt_iso_find_image_in_dir(gdir.c_str(), img, sizeof(img))) {
       std::vector<exe_cand> icands;
@@ -1066,29 +1073,14 @@ void scan_game_entry(
     }
   }
   std::string steam_exe;
-  if (image_path.empty()) {
-    std::ifstream launch_file(gdir + longan::kSteamLaunchExe);
-    if (std::getline(launch_file, steam_exe)) {
-      if (!steam_exe.empty() && steam_exe.back() == '\r') steam_exe.pop_back();
-      // A Steam entry can be deeper than the shelf scan or filtered as a helper.
-      if (!steam_exe.empty() && std::none_of(cands.begin(), cands.end(), [&](const exe_cand& c) {
-            return _stricmp(c.rel.c_str(), steam_exe.c_str()) == 0;
-          })) {
-        trt_engine_profile profile;
-        if (trt_synthesize_engine(gdir.c_str(), steam_exe.c_str(), &profile)) {
-          steam_exe = profile.main_exe_rel;
-          const auto found = std::find_if(cands.begin(), cands.end(), [&](const exe_cand& c) {
-            return _stricmp(c.rel.c_str(), steam_exe.c_str()) == 0;
-          });
-          if (found == cands.end()) {
-            exe_cand candidate{};
-            candidate.rel = steam_exe;
-            cands.push_back(candidate);
-          }
-        } else {
-          steam_exe.clear();
-        }
-      }
+  if (steam_install.state == longan::steam_install_state::ready) {
+    steam_exe = steam_install.executable;
+    if (std::none_of(cands.begin(), cands.end(), [&](const exe_cand& candidate) {
+          return _stricmp(candidate.rel.c_str(), steam_exe.c_str()) == 0;
+        })) {
+      exe_cand selected{};
+      selected.rel = steam_exe;
+      cands.push_back(std::move(selected));
     }
   }
   if (cands.empty()) return;
@@ -2937,39 +2929,57 @@ struct tiramisu_host
     longan::audio_shutdown();
   }
 
+  HRESULT m_graphics_status = E_FAIL;
+
+  HRESULT init_launcher_ui(const longan::swapchain_result& swapchain) {
+    if (FAILED(swapchain.device_hr)) return swapchain.device_hr;
+    if (FAILED(swapchain.sc_hr)) return swapchain.sc_hr;
+
+    winrt::com_ptr<ID2D1Factory1> d2d_factory;
+    const D2D1_FACTORY_OPTIONS options{};
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                   __uuidof(ID2D1Factory1), &options, d2d_factory.put_void());
+    if (FAILED(hr)) return hr;
+    winrt::com_ptr<IDWriteFactory> write_factory;
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                              reinterpret_cast<IUnknown**>(write_factory.put()));
+    if (FAILED(hr)) return hr;
+
+    auto* d3d = static_cast<ID3D11Device1*>(longan::swapchain_d3d());
+    if (!d3d) return E_POINTER;
+    winrt::com_ptr<IDXGIDevice> dxgi_device;
+    hr = d3d->QueryInterface(__uuidof(IDXGIDevice), dxgi_device.put_void());
+    if (FAILED(hr)) return hr;
+    winrt::com_ptr<ID2D1Device> d2d_device;
+    hr = d2d_factory->CreateDevice(dxgi_device.get(), d2d_device.put());
+    if (FAILED(hr)) return hr;
+    return longan::ui_init(swapchain.width, swapchain.height, d2d_factory.get(),
+                           write_factory.get(), d2d_device.get(), longan::swapchain_dxgi());
+  }
+
   void SetWindow(CoreWindow const& window) {
     m_window = window;
     // The FNA backend renders into this CoreWindow: hand its ABI
     // pointer to the native FNA layer (FNA's CreateWindow returns it;
     // the FNA3D D3D11 driver consumes it later).
     trt_fna_set_window_handle((void*)winrt::get_abi(window));
-    const auto sc = longan::swapchain_create(window);
+    longan::swapchain_result sc{E_FAIL, E_FAIL, 1280, 720, 0};
+    try {
+      sc = longan::swapchain_create(window);
+      m_graphics_status = init_launcher_ui(sc);
+    } catch (const winrt::hresult_error& error) {
+      m_graphics_status = error.code();
+    }
     char line[256];
     snprintf(line, sizeof(line),
-             "probe: d3d11 hr=0x%08lx fl=%u swapchain hr=0x%08lx %ux%u flip",
+             "graphics startup: device=0x%08lx level=0x%x swapchain=0x%08lx ui=0x%08lx %ux%u",
              (unsigned long)sc.device_hr, sc.feature_level,
-             (unsigned long)sc.sc_hr, sc.width, sc.height);
+             (unsigned long)sc.sc_hr, (unsigned long)m_graphics_status,
+             sc.width, sc.height);
     longan::log_line(line);
+    if (FAILED(m_graphics_status))
+      longan::log_line("graphics startup failed; continuing to the LAN dashboard");
 
-    ID2D1Factory1* d2df = nullptr;
-    D2D1_FACTORY_OPTIONS fo{};
-    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                      __uuidof(ID2D1Factory1), &fo, (void**)&d2df);
-    IDWriteFactory* dwf = nullptr;
-    DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                        (IUnknown**)&dwf);
-    void* d2d_device_v = nullptr;
-    ID3D11Device1* d3d = (ID3D11Device1*)longan::swapchain_d3d();
-    if (d3d) {
-      IDXGIDevice* dxgidev = nullptr;
-      d3d->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgidev);
-      if (dxgidev) {
-        ID2D1Device* d2ddev = nullptr;
-        d2df->CreateDevice(dxgidev, &d2ddev);
-        d2d_device_v = d2ddev;
-        dxgidev->Release();
-      }
-    }
     // Opt into full-screen CoreWindow bounds. Keep the standard Arrow
     // available whenever the launcher is not drawing its own pointer.
     try {
@@ -2981,9 +2991,7 @@ struct tiramisu_host
     }
     trt_input_display_size(static_cast<int>(sc.width),
                            static_cast<int>(sc.height));
-    longan::ui_init(sc.width, sc.height, d2df, dwf, d2d_device_v,
-                    longan::swapchain_dxgi());
-    longan::swapchain_bind_d3d9();
+    if (SUCCEEDED(sc.sc_hr)) longan::swapchain_bind_d3d9();
     trt_input_set_cursor_pos(static_cast<int>(sc.width / 2),
                              static_cast<int>(sc.height / 2));
 
@@ -3207,25 +3215,26 @@ struct tiramisu_host
       return;
     }
     if (it.installed) {
-      std::string launch_name;
-      for (const auto& ge : g_games) {
-        if (!it.install_dir.empty() &&
-            _stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
-          launch_name = ge.name;
-          break;
-        }
+      const auto install = longan::inspect_steam_install(it.install_dir);
+      if (install.app_id != app_id || install.state != longan::steam_install_state::ready) {
+        longan::steam_client_rescan_local();
+        rescan_games_root_only();
+        longan::ui_toast(L"Steam install is incomplete or its executable is missing", 4.0f);
+        return;
       }
-      if (launch_name.empty() && !it.install_dir.empty()) {
-        rescan_games();
-        for (const auto& ge : g_games) {
-          if (_stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
-            launch_name = ge.name;
-            break;
-          }
-        }
+      const auto matches_install = [&](const game_entry& game) {
+        return _stricmp(game.dir.c_str(), it.install_dir.c_str()) == 0;
+      };
+      auto game = std::find_if(g_games.begin(), g_games.end(), matches_install);
+      if (game == g_games.end()) {
+        rescan_games_root_only();
+        game = std::find_if(g_games.begin(), g_games.end(), matches_install);
       }
-      if (launch_name.empty()) launch_name = it.title;
-      g_pending_launch = launch_name;
+      if (game == g_games.end()) {
+        longan::ui_toast(L"Steam install could not be added to the game library", 4.0f);
+        return;
+      }
+      g_pending_launch = {game->name, game->dir, install.executable};
     } else if (!it.downloading) {
       if (!longan::steam_client_account().signed_in) {
         longan::ui_toast(L"Sign in with Steam to install this game", 3.0f);
@@ -3403,7 +3412,7 @@ struct tiramisu_host
         break;
       case longan::ui_click_type::play:
         if (hit.index >= 0 && hit.index < static_cast<int>(g_games.size())) {
-          g_pending_launch = g_games[hit.index].name;
+          g_pending_launch = {g_games[hit.index].name, {}, {}};
           longan::ui_sfx_launch();
           longan::ui_toast(L"Launching " + u82ws(g_games[hit.index].name) + L"…", 3.0f);
         }
@@ -3523,15 +3532,11 @@ struct tiramisu_host
       if (current) steps.push_back(current);
       longan::ui_set_setup(steps, (int)done.size(), finished);
     };
-    setup_steps({L"Storage ready"}, L"Checking Direct3D 11 device…", false);
-
-    // (the swapchain was created in SetWindow; report it as the D3D step)
-    snprintf(line, sizeof(line), "setup: d3d11 ready (swapchain created in SetWindow)");
-    longan::log_line(line);
-    setup_steps({L"Storage ready", L"Direct3D 11 ready"}, L"Probing gamepads…",
-                false);
+    const wchar_t* graphics_step = SUCCEEDED(m_graphics_status)
+        ? L"Direct3D 11 ready" : L"Display unavailable; check LAN dashboard logs";
+    setup_steps({L"Storage ready", graphics_step}, L"Probing gamepads…", false);
     run_probes();
-    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed"},
+    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed"},
                 L"Starting audio output…", false);
     longan::audio_init();
     longan::audio_status(line, sizeof(line));
@@ -3595,14 +3600,14 @@ struct tiramisu_host
     }
     const std::wstring url_step = url.empty() ? L"Transfer unavailable"
                                               : L"Transfer server ready";
-    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
+    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed",
                  L"Audio ready", url_step},
                 L"Scanning for games…", false);
     poll_external_storage(true);
     rescan_games();
     longan::steam_client_init(g_local_state, g_games_dir);
     trt_steam_load_account(g_local_state.c_str());
-    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
+    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed",
                  L"Audio ready", url_step, L"Game shelf scanned"},
                 L"Running the built-in self-test…", false);
 
@@ -3616,14 +3621,20 @@ struct tiramisu_host
     };
     trt_module_register("tiramisu_host.dll", TRT_ROUTE_BUILTIN,
                         k_host_builtin_fns, 2);
-    const auto gr = run_game("selftest", "guest_hello.exe", package_install_path());
-    snprintf(line, sizeof(line), "selftest: rc=%s (%s)", trt_errstr(gr.map_rc),
-             gr.detail);
-    longan::log_line(line);
-    set_guest_status(std::string("selftest ") + trt_errstr(gr.map_rc));
-    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
-                 L"Audio ready", url_step, L"Game shelf scanned",
-                 L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
+    std::wstring selftest_step = L"Self-test skipped after display startup failure";
+    if (SUCCEEDED(m_graphics_status)) {
+      const auto gr = run_game("selftest", "guest_hello.exe", package_install_path());
+      snprintf(line, sizeof(line), "selftest: rc=%s (%s)", trt_errstr(gr.map_rc), gr.detail);
+      longan::log_line(line);
+      set_guest_status(std::string("selftest ") + trt_errstr(gr.map_rc));
+      selftest_step = L"Self-test: " + u82ws(trt_errstr(gr.map_rc));
+    } else {
+      snprintf(line, sizeof(line), "Display startup failed (0x%08lx); see startup logs",
+               (unsigned long)m_graphics_status);
+      set_guest_status(line);
+    }
+    setup_steps({L"Storage ready", graphics_step, L"Gamepads probed",
+                 L"Audio ready", url_step, L"Game shelf scanned", selftest_step},
                 nullptr, true);
     g_setup_done = true;
     sync_settings_rows();
@@ -4267,7 +4278,7 @@ struct tiramisu_host
               g_setup_active = false;
               longan::ui_dismiss_first_run();
             } else if (!g_setup_active && !g_games.empty()) {
-              g_pending_launch = g_games[g_selected].name;
+              g_pending_launch = {g_games[g_selected].name, {}, {}};
               longan::ui_sfx_launch();
               longan::ui_toast(L"Launching " + u82ws(g_games[g_selected].name) + L"…", 3.0f);
             } else if (!g_setup_active && g_games.empty()) {
@@ -4309,7 +4320,7 @@ struct tiramisu_host
           if (want_go && !a_btn) {
             a_btn = true;
             if (!g_games.empty()) {
-              g_pending_launch = g_games[g_selected].name;
+              g_pending_launch = {g_games[g_selected].name, {}, {}};
               longan::ui_sfx_launch();
               longan::ui_toast(L"Launching " + u82ws(g_games[g_selected].name) + L"…", 3.0f);
             }
@@ -4559,7 +4570,7 @@ struct tiramisu_host
         }
         std::string webname;
         if (longan::webxfer_poll_launch(&webname)) {
-          g_pending_launch = webname;
+          g_pending_launch = {webname, {}, {}};
           longan::host_ap_on_launch(webname);
           if (g_setup_active && g_setup_done) {
             g_setup_active = false;
@@ -4570,13 +4581,17 @@ struct tiramisu_host
             if (_stricmp(ge.name.c_str(), webname.c_str()) == 0) { found = true; break; }
           if (!found) rescan_games();
         }
-        if (!g_pending_launch.empty()) {
-          const std::string want = g_pending_launch;
-          g_pending_launch.clear();
-          bool shelf_hit = false;
-          for (const auto& ge : g_games)
-            if (_stricmp(ge.name.c_str(), want.c_str()) == 0) { shelf_hit = true; break; }
-          if (!shelf_hit) {
+        if (!g_pending_launch.name.empty()) {
+          const auto request = std::move(g_pending_launch);
+          g_pending_launch = {};
+          const auto& want = request.name;
+          const auto matches_request = [&](const game_entry& game) {
+            if (!request.directory.empty())
+              return !game.dir.empty() && _stricmp(game.dir.c_str(), request.directory.c_str()) == 0;
+            return _stricmp(game.name.c_str(), want.c_str()) == 0;
+          };
+          const bool shelf_hit = std::any_of(g_games.begin(), g_games.end(), matches_request);
+          if (!shelf_hit && request.directory.empty()) {
             // console reality: the shelf's FindFirstFileA scan can come up
             // empty while the web dashboard's enumeration lists the game —
             // fall back to the webxfer's own list so a web launch NEVER
@@ -4608,8 +4623,12 @@ struct tiramisu_host
               longan::host_ap_on_result(want, "not found");
             }
           }
+          if (!shelf_hit && !request.directory.empty()) {
+            longan::ui_toast(L"Steam install is no longer in the game library", 4.0f);
+            longan::webxfer_set_launch_result(want, "install no longer available");
+          }
           for (const auto& ge : g_games) {
-            if (_stricmp(ge.name.c_str(), want.c_str()) == 0) {
+            if (matches_request(ge)) {
               // The previous guest thread may still be unwinding after
               // run_game returned (the running flag clears in the lambda's
               // tail, so this join normally returns at once) — but never
@@ -4657,7 +4676,7 @@ struct tiramisu_host
               }
               g_running_game_name = want;
               g_guest_running.store(true);
-              const std::string exe = ge.exe;
+              const std::string exe = request.executable.empty() ? ge.exe : request.executable;
               const std::string gdir = ge.dir;
               const std::string img = ge.image;
               g_guest_thread = std::thread([want, exe, gdir, img]() {

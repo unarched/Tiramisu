@@ -46,7 +46,8 @@ typedef struct trt_gpu_hooks {
                                           void** out_ctx, u32* out_level);
   int (TRT_GUEST_ABI *configure_d3d11_swapchain)(u32 width, u32 height,
                                                     u32 format, u32 buffer_count,
-                                                    u32 swap_effect);
+                                                    u32 swap_effect, u32 sample_count,
+                                                    u32 sample_quality);
   int (TRT_GUEST_ABI *get_d3d11_backbuffer)(u32 index, const void* iid, void** out);
   void (TRT_GUEST_ABI *prepare_d3d11_present)(void);
 } trt_gpu_hooks;
@@ -74,6 +75,7 @@ typedef struct trt_gpu_render_stats {
   u32 d3d11_buffer_count;
   u32 d3d11_stable_backbuffer;
   u32 d3d11_width, d3d11_height;
+  u32 d3d11_sample_count, d3d11_sample_quality;
 } trt_gpu_render_stats;
 
 typedef struct trt_gpu_resize_stats {

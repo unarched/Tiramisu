@@ -68,6 +68,12 @@ xbox_console_generation parse_console_generation_string(const char* str);
 // buffer is supplied).
 int console_feature_levels(xbox_console_generation gen, unsigned* out, int cap);
 
+// Older D3D11 runtimes reject a list beginning at 11_1 with E_INVALIDARG.
+constexpr bool retry_d3d11_without_11_1(int32_t result, unsigned first_level, int count) {
+  return static_cast<uint32_t>(result) == 0x80070057u &&
+         first_level == 0xb100u && count > 1;
+}
+
 // Limit new guest allocations to the application's measured free memory.
 unsigned console_guest_memory_budget_mb(unsigned configured_mb, uint64_t app_usage,
                                         uint64_t app_limit);

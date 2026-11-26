@@ -1,6 +1,7 @@
 // tiramisu/tests/test_engine_synthesizer.cpp
 // Verification of the Autonomous Engine Synthesizer & Dynamic API Synthesizer.
 #include "../src/trt/engine_synthesizer.h"
+#include "../src/host/steam_install.h"
 #include "../src/trt/bridge_opengl32.h"
 #include "../src/trt/dynamic_api.h"
 #include "../src/trt/thunk.h"
@@ -69,7 +70,8 @@ void make_fake_file(const std::string& path, const std::string& content) {
 // than on file names.
 void make_pe_with_imports(const std::string& path, uint16_t magic,
                           const std::vector<std::string>& modules,
-                          uint32_t raw_ptr = 0x400) {
+                          uint32_t raw_ptr = 0x400,
+                          const char* delay_module = nullptr) {
   const bool pe32 = (magic == 0x10b);
   const uint32_t name_rva = 0x1050;
   std::vector<unsigned char> buf(0x600, 0);
@@ -118,6 +120,19 @@ void make_pe_with_imports(const std::string& path, uint16_t magic,
     if (noff + modules[i].size() + 1 < buf.size()) {
       memcpy(&buf[noff], modules[i].c_str(), modules[i].size());
     }
+  }
+
+  if (delay_module) {
+    const uint32_t delay_rva = 0x1100;
+    const uint32_t delay_size = 2 * sizeof(trt_delayload_descriptor);
+    memcpy(&buf[dirs + TRT_PE_DIR_DELAY_IMPORT * 8], &delay_rva, 4);
+    memcpy(&buf[dirs + TRT_PE_DIR_DELAY_IMPORT * 8 + 4], &delay_size, 4);
+    trt_delayload_descriptor delay{};
+    delay.attributes = 1;
+    delay.name_rva = 0x1180;
+    memcpy(&buf[0x500], &delay, sizeof(delay));
+    CHECK(strlen(delay_module) < 0x80, "delay import fits in the fixture");
+    memcpy(&buf[0x580], delay_module, strlen(delay_module));
   }
 
   FILE* f = fopen(path.c_str(), "wb");
@@ -871,6 +886,102 @@ int main() {
     CHECK(trt_engine_write_user_settings(&un2, drive, no_ini,
                                          sizeof(no_ini)) == 0,
           "no user-settings file is invented for an engine that has none");
+  }
+
+  printf("== 17. Steam Install Readiness ==\n");
+  {
+    using longan::inspect_steam_install;
+    using longan::steam_install_state;
+    namespace fs = std::filesystem;
+    char install_template[] = "tests/out/test_steam_install_XXXXXX";
+    const char* install = mkdtemp(install_template);
+    CHECK(install != nullptr, "created isolated Steam install");
+    const fs::path root(install);
+    const fs::path metadata = root / ".tiramisu";
+    const fs::path launch = metadata / "steam-launch-exe.txt";
+    const fs::path pending = metadata / "steam-install-pending";
+    CHECK(fs::create_directories(root / "Binaries" / "Win64"), "created nested executable directory");
+    CHECK(fs::create_directory(metadata), "created Steam metadata directory");
+
+    make_fake_file((root / "steam_appid.txt").string(), "987654\n");
+    CHECK(inspect_steam_install(install).state == steam_install_state::missing_executable,
+          "an AppID alone does not make a downloaded title ready to play");
+    make_pe_with_imports((root / "dxsetup.exe").string(), 0x20b, {"kernel32.dll"});
+    CHECK(inspect_steam_install(install).state == steam_install_state::missing_executable,
+          "a redistributable installer does not make the title playable");
+    make_pe_with_imports((root / "Binaries" / "Win64" / "Title.exe").string(), 0x20b,
+                         {"d3d11.dll"});
+    const auto legacy = inspect_steam_install(install);
+    CHECK(legacy.app_id == 987654 && legacy.state == steam_install_state::ready &&
+              legacy.executable == "Binaries\\Win64\\Title.exe",
+          "a completed legacy install discovers its real nested executable");
+    CHECK(!fs::exists(metadata / "profile.json"), "readiness never writes an engine profile");
+
+    make_fake_file(launch.string(), "Missing.exe\n.\n-option\n");
+    CHECK(inspect_steam_install(install).state == steam_install_state::missing_executable,
+          "stale published launch metadata cannot fall back to other executables");
+    make_fake_file((root / "Truncated.exe").string(), "MZ");
+    make_fake_file(launch.string(), "Truncated.exe\n");
+    CHECK(inspect_steam_install(install).state == steam_install_state::missing_executable,
+          "a partial executable does not make an install ready");
+    make_fake_file(launch.string(), "..\\OtherGame.exe\n");
+    CHECK(inspect_steam_install(install).state == steam_install_state::missing_executable,
+          "launch metadata cannot escape the install");
+    make_fake_file(launch.string(), "Binaries\\Win64\\Title.exe\r\n.\r\n-option\r\n");
+    make_fake_file(pending.string(), "987654\n");
+    CHECK(inspect_steam_install(install).state == steam_install_state::incomplete,
+          "a pending install remains hidden even after its executable arrives");
+    CHECK(fs::remove(pending), "simulated final publication of the Steam install");
+    const auto published = inspect_steam_install(install);
+    CHECK(published.app_id == 987654 && published.state == steam_install_state::ready &&
+              published.executable == "Binaries\\Win64\\Title.exe",
+          "the published launch metadata becomes ready once");
+  }
+
+  printf("== 18. Startup and delay-loaded graphics ==\n");
+  {
+    char directory[] = "tests/out/test_optional_graphics_XXXXXX";
+    CHECK(mkdtemp(directory), "created isolated delay import fixture");
+    const std::string root = directory;
+    make_pe_with_imports(root + "/Game.exe", 0x10b, {"d3d9.dll"}, 0x400, "d3d12.dll");
+    trt_engine_profile profile;
+    CHECK(trt_synthesize_engine(root.c_str(), "Game.exe", &profile) &&
+              profile.preferred_gfx == TRT_GFX_D3D9,
+          "a delayed D3D12 import cannot override the startup D3D9 API");
+
+    make_pe_with_imports(root + "/Game.exe", 0x10b, {"RenderCore.dll"}, 0x400, "OptionalFx.dll");
+    make_pe_with_imports(root + "/RenderCore.dll", 0x10b, {"d3d9.dll"});
+    make_pe_with_imports(root + "/OptionalFx.dll", 0x10b, {"d3d12.dll"});
+    CHECK(trt_synthesize_engine(root.c_str(), "Game.exe", &profile) &&
+              profile.preferred_gfx == TRT_GFX_D3D9,
+          "ordinary imports of a delay-loaded DLL stay optional");
+    CHECK(std::binary_search(profile.imported_modules.begin(), profile.imported_modules.end(),
+                             std::string("d3d12.dll")),
+          "optional capabilities remain visible for diagnosis");
+    CHECK(profile.import_roles_scanned &&
+              !std::binary_search(profile.startup_modules.begin(), profile.startup_modules.end(),
+                                  std::string("d3d12.dll")),
+          "optional capabilities are absent from the startup import closure");
+
+    make_pe_with_imports(root + "/RenderCore.dll", 0x10b, {"d3d9.dll", "OptionalFx.dll"});
+    CHECK(trt_synthesize_engine(root.c_str(), "Game.exe", &profile) &&
+              std::binary_search(profile.startup_modules.begin(), profile.startup_modules.end(),
+                                 std::string("d3d12.dll")),
+          "a dependency referenced by both graphs remains in the startup graph");
+
+    make_pe_with_imports(root + "/Game.exe", 0x10b, {"kernel32.dll"}, 0x400, "d3d12.dll");
+    CHECK(trt_synthesize_engine(root.c_str(), "Game.exe", &profile) &&
+              profile.preferred_gfx == TRT_GFX_D3D12 && profile.graphics_from_delay_imports,
+          "a delay-only renderer is preserved as a hint");
+    trt_host_caps caps{};
+    caps.compositor = caps.d3d11_device = caps.audio_device = 1;
+    trt_preflight_report report;
+    CHECK(trt_engine_launch_preflight(&profile, &caps, &report) == 0 && report.runnable &&
+              std::any_of(report.notes.begin(), report.notes.end(), [](const std::string& note) {
+                return note.find("Delay-loaded graphics hint") != std::string::npos;
+              }),
+          "an unavailable delay-only renderer yields a preflight note");
+
   }
 
   printf("ALL ENGINE SYNTHESIZER CHECKS PASSED CLEANLY.\n");

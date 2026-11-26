@@ -1,0 +1,63 @@
+{
+  "date": "2026-11-26",
+  "console": "Xbox Series S",
+  "package_version": "0.2.4.56",
+  "package_sha256": "abaebf9aa24bdd7e11ac4a7b8294cceb975274a8b21b10583f9fca3e3cb9e6b8",
+  "entry_point": "Play",
+  "offline": {
+    "mutex_abandonment_regression": "failed before, passed after",
+    "explicit_dll_path_regression": "failed before, passed after",
+    "build_gate": "passed with the Celeste execution stage disabled",
+    "load_only_pe_corpus_ok": 123,
+    "uwp_build": "passed"
+  },
+  "cuphead": {
+    "sampled_render_counters_max": {
+      "d3d11_device_calls": 1,
+      "d3d11_swapchains": 1,
+      "d3d11_successful_presents": 1690,
+      "d3d11_sample_count": 1,
+      "draw_probe_samples": 14,
+      "draw_probe_pixel_invocations": 307200,
+      "guest_lit_pixels": 0,
+      "host_lit_pixels": 0,
+      "draw_probe_nonempty_samples": 14,
+      "surface_guest_rtv_samples": 0,
+      "surface_other_rtv_samples": 14,
+      "surface_other_lit_pixels": 0,
+      "shader_input_samples": 12,
+      "shader_input_lit_pixels": 16
+    },
+    "black_screen_captures": [
+      "30s",
+      "55s",
+      "after Z",
+      "after Enter",
+      "after Down"
+    ],
+    "visible_menu": false,
+    "visible_game_response": false,
+    "checkpoint_after_restarting_for_next_test": {
+      "phase": "native entry",
+      "outcome": "host fault",
+      "code": "0xc0000005",
+      "timing": "recorded after the final black capture, observed on reopening Tiramisu"
+    }
+  },
+  "sekiro": {
+    "last_checkpoint_phase": "native entry",
+    "checkpoint_outcome": "running",
+    "last_live_api_call_count": 522,
+    "last_live_synchronization_counters": {
+      "sync_wait_completed": 131,
+      "sync_wait_timeout": 0,
+      "sync_wait_failed": 0,
+      "sync_setevent_signaled": 52,
+      "sync_setevent_failed": 0
+    },
+    "d3d11_initialization_observed": false,
+    "dashboard_unreachable_at_first_scheduled_check_seconds": 6,
+    "saved_worker_fault_available": false,
+    "visible_menu": false
+  }
+}

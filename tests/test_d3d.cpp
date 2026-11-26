@@ -15,6 +15,7 @@
 // The vtable slots below are the SDK's (extracted from d3d11.h/dxgi1_2.h):
 // IUnknown is 3 slots, then the interface's own methods in declaration order.
 #include "../src/trt/trt.h"
+#include "../src/trt/input.h"
 #include "../src/trt/bridge_d3d.h"
 
 #include <stdio.h>
@@ -152,6 +153,7 @@ extern "C" TRT_GUEST_ABI int fake_generic_hr(void*, void*, void*, void*) { retur
 static u32 g_requested_width, g_requested_height;
 static u32 g_requested_swapchain_format;
 static u32 g_requested_swapchain_buffers;
+static u32 g_requested_sample_count, g_requested_sample_quality;
 static u32 g_requested_swap_effect;
 static unsigned g_prepare_presents;
 static int TRT_GUEST_ABI get_alternate_backbuffer(u32 index, const void*, void** out) {
@@ -164,10 +166,13 @@ static void TRT_GUEST_ABI prepare_present() {
 }
 static int g_swapchain_format_result;
 static int TRT_GUEST_ABI set_swapchain_format(u32 width, u32 height, u32 format,
-                                              u32 buffer_count, u32 swap_effect) {
+                                              u32 buffer_count, u32 swap_effect,
+                                           u32 sample_count, u32 sample_quality) {
   g_requested_width = width;
   g_requested_height = height;
   g_requested_swapchain_format = format;
+  g_requested_sample_count = sample_count;
+  g_requested_sample_quality = sample_quality;
   g_requested_swapchain_buffers = buffer_count;
   g_requested_swap_effect = swap_effect;
   return g_swapchain_format_result;
@@ -275,13 +280,27 @@ extern "C" TRT_GUEST_ABI int fake_sc_Present(void* self, u32 sync, u32 flags) {
   return 0;
 }
 
-// IDXGISwapChain: 3 + 15 = 18 slots
-const void* g_sc_vtbl[18] = {
+int g_native_resize_status = 0;
+unsigned g_native_resize_calls = 0;
+unsigned g_native_resize1_calls = 0;
+int TRT_GUEST_ABI mock_native_resize(void*, u32, u32, u32, u32, u32) {
+  ++g_native_resize_calls;
+  return g_native_resize_status;
+}
+int TRT_GUEST_ABI mock_native_resize1(void*, u32, u32, u32, u32, u32,
+                                      const u32*, void* const*) {
+  ++g_native_resize1_calls;
+  return g_native_resize_status;
+}
+
+const void* g_sc_vtbl[41] = {
     [0] = (const void*)&fake_generic_hr,
     [1] = (const void*)&fake_AddRef,
     [2] = (const void*)&fake_generic_hr,
     [8] = (const void*)&fake_sc_Present,   // Present
     [9] = (const void*)&fake_sc_GetBuffer, // GetBuffer
+    [13] = (const void*)&mock_native_resize,
+    [39] = (const void*)&mock_native_resize1,
 };
 
 // --- the console's real factory (the one the shim forwards to) ---
@@ -479,6 +498,8 @@ int main(int argc, char** argv) {
   desc[0] = 1024;
   desc[1] = 576;
   desc[4] = 29;  // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+  desc[7] = 4;   // Multisampled desktop DISCARD backbuffer.
+  desc[8] = 1;
   desc[10] = 2;
   desc[15] = 0;   // DXGI_SWAP_EFFECT_DISCARD
   hooks.configure_d3d11_swapchain = &set_swapchain_format;
@@ -496,6 +517,8 @@ int main(int argc, char** argv) {
             g_requested_swapchain_format == 29 && g_requested_swapchain_buffers == 2 &&
             g_requested_swap_effect == 0,
         "combined creation forwards guest dimensions, format, buffer count and swap effect");
+  CHECK(g_requested_sample_count == 4 && g_requested_sample_quality == 1,
+        "combined creation requests a real multisampled host texture");
   CHECK(trt_gpu_d3d11_uses_stable_backbuffer(2, 0) &&
             !trt_gpu_d3d11_uses_stable_backbuffer(2, 3),
         "desktop DISCARD gets a stable backbuffer while native flip keeps rotating");
@@ -512,11 +535,19 @@ int main(int argc, char** argv) {
               reported[0] == 1024 && reported[1] == 576 &&
               reported[4] == 29 && reported[10] == 2 && reported[15] == 0,
           "GetDesc describes the guest sRGB desktop chain");
+    CHECK(reported[7] == 4 && reported[8] == 1,
+          "desktop GetDesc preserves the multisample count and quality");
+    u32 reported1[12] = {};
+    CHECK(((get_desc_fn)vt[18])(sc, reported1) == 0 &&
+              reported1[4] == 4 && reported1[5] == 1,
+          "GetDesc1 preserves the same multisample description");
     CHECK(((index_fn)vt[36])(sc) == 0, "stable backbuffer stays at index zero");
     CHECK(((resize_fn)vt[13])(sc, 0, 1280, 720, 0, 0) == 0 &&
               g_requested_width == 1280 && g_requested_height == 720 &&
               g_requested_swapchain_buffers == 2 && g_requested_swap_effect == 0,
           "ResizeBuffers retains the guest count and swap effect for zero count");
+    CHECK(g_requested_sample_count == 4 && g_requested_sample_quality == 1,
+          "ResizeBuffers keeps the original sample configuration");
     void* buffer = nullptr;
     CHECK(((buffer_fn)vt[9])(sc, 0, nullptr, &buffer) == 0 && buffer == g_fake_rtv,
           "combined swapchain exposes the virtual guest backbuffer");
@@ -534,6 +565,13 @@ int main(int argc, char** argv) {
         "render counters exclude test presents and report the virtual surface");
   CHECK(stats.d3d11_width == 1280 && stats.d3d11_height == 720,
         "render counters report the last successful guest size");
+  desc[15] = 3;  // DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+  hr = trt_D3D11CreateDeviceAndSwapChain(nullptr, 1, nullptr, 0, req_asc, 2, 7,
+                                         desc, &sc, &dev, &got_level, &ctx);
+  CHECK(static_cast<u32>(hr) == 0x887a0001u && !sc && !dev && !ctx,
+        "DXGI rejects a multisampled flip swap chain");
+  desc[15] = 0;
+
 
   g_swapchain_format_result = (int)0x80070057u;
   g_added_refs = 0;
@@ -597,6 +635,50 @@ int main(int argc, char** argv) {
             "IDXGISwapChain::ResizeBuffers handles fixed CoreWindow cleanly");
       CHECK(((pres_t)svt[8])(proxy_sc, 0, 0x200u) == 0 && g_presented == 2,
             "IDXGISwapChain::Present strips ALLOW_TEARING and forwards");
+      constexpr int invalid_resize = static_cast<int>(0x887A0001u);
+      hooks.swapchain3 = g_fake_swapchain;
+      trt_gpu_set_hooks(&hooks);
+      g_native_resize_status = invalid_resize;
+      g_native_resize_calls = g_native_resize1_calls = 0;
+      CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, 87, 0) == invalid_resize,
+            "a native ResizeBuffers failure reaches the guest");
+      using resize1_fn = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32,
+                                              const u32*, void* const*);
+      CHECK(((resize1_fn)svt[39])(proxy_sc, 2, 1920, 1080, 87, 0, nullptr,
+                                  nullptr) == invalid_resize &&
+                g_native_resize1_calls == 1 && g_native_resize_calls == 1,
+            "a failed ResizeBuffers1 is not retried via an incompatible API");
+      g_native_resize_status = 0;
+
+      trt_input_display_size(1920, 1080);
+      using output_fn = int (TRT_GUEST_ABI *)(void*, void**);
+      void* output = nullptr;
+      CHECK(((output_fn)svt[15])(proxy_sc, &output) == 0 && output,
+            "the CoreWindow fallback supplies a virtual output");
+      if (output) {
+        const auto* ovt = *static_cast<const void***>(output);
+        using modes_fn = int (TRT_GUEST_ABI *)(void*, u32, u32, u32*, void*);
+        using closest_fn = int (TRT_GUEST_ABI *)(void*, const void*, void*, void*);
+        u32 modes[2][7]{};
+        u32 n = 2;
+        CHECK(((modes_fn)ovt[8])(output, 28, 0, &n, modes) == 0 && n == 2,
+              "the virtual output enumerates its two supported modes");
+        u32 request[7]{320, 240, 75, 1, 28, 0, 0};
+        u32 matched[7]{};
+        CHECK(((closest_fn)ovt[9])(output, request, matched, dev) == 0 &&
+                  memcmp(matched, modes[1], sizeof(matched)) == 0 &&
+                  matched[0] == 1280 && matched[1] == 720,
+              "closest mode matches an enumerated mode and its refresh rate");
+        request[0] = request[1] = 0;
+        CHECK(((closest_fn)ovt[9])(output, request, matched, dev) == 0 &&
+                  memcmp(matched, modes[0], sizeof(matched)) == 0,
+              "automatic mode selection uses the active display");
+        request[1] = 720;
+        CHECK(((closest_fn)ovt[9])(output, request, matched, dev) < 0,
+              "a partially specified display mode is rejected");
+        using release_fn = u32 (TRT_GUEST_ABI *)(void*);
+        ((release_fn)ovt[2])(output);
+      }
       hooks.configure_d3d11_swapchain = &set_swapchain_format;
       trt_gpu_set_hooks(&hooks);
       const u32 rgba_srgb = 29;

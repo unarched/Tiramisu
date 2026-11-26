@@ -114,7 +114,7 @@ struct ui_setting {
   bool is_int;
 };
 
-void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
+int32_t ui_init(unsigned width, unsigned height, void* d2d_factory_v,
              void* dwrite_factory_v, void* d2d_device_v, void* swapchain_v);
 void ui_shutdown();
 void ui_set_games(const std::vector<ui_game>& games, int selected);

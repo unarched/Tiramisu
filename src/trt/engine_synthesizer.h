@@ -96,6 +96,7 @@ struct trt_engine_profile {
 
   trt_engine_type engine_type = TRT_ENGINE_UNKNOWN;
   trt_graphics_api preferred_gfx = TRT_GFX_D3D11;
+  bool graphics_from_delay_imports = false;
   trt_audio_middleware preferred_audio = TRT_AUDIO_UNKNOWN;
 
   uint32_t steam_appid = 0;
@@ -107,6 +108,9 @@ struct trt_engine_profile {
   std::vector<std::string> synthetic_shims;
   // Lower-case imports from the executable and its reachable bundled DLLs.
   std::vector<std::string> imported_modules;
+  // Ordinary imports reachable without following a delay-loaded dependency.
+  std::vector<std::string> startup_modules;
+  bool import_roles_scanned = false;
   std::string summary;
 };
 
@@ -155,6 +159,11 @@ uint32_t trt_steam_read_appid(const char* game_dir);
 // on success.
 bool trt_synthesize_engine(const char* game_dir, const char* target_exe_hint,
                            trt_engine_profile* out_profile);
+
+// Locate a supported x86/x64 executable without generating launch files.
+// A supplied relative path must identify the exact executable.
+bool trt_find_guest_executable(const char* game_dir, const char* relative_exe,
+                               std::string* selected);
 
 // Synthesize engine profile directly for a single executable file.
 // Inspects headers, imports, delay-imports, and engine byte signatures without

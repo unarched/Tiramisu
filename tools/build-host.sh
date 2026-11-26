@@ -77,7 +77,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   -I third_party/faudio-src/src \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
-  src/host/crash_report.cpp src/host/steam_client.cpp src/host/cover_art.cpp \
+  src/host/crash_report.cpp src/host/steam_client.cpp src/host/steam_install.cpp src/host/cover_art.cpp \
   src/host/boot_anim.cpp src/host/console_detect.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
   src/trt/dynamic_api.cpp src/trt/engine_synthesizer.cpp \

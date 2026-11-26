@@ -71,6 +71,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 #ifdef _WIN32
@@ -255,6 +256,15 @@ bool write_profile_json(const std::string& base_dir,
     fprintf(pf, "%s\"%s\"", i ? ", " : "", json_escape(p->imported_modules[i]).c_str());
   }
   fprintf(pf, "],\n");
+  if (p->import_roles_scanned) {
+    fprintf(pf, "  \"startup_imports\": [");
+    for (size_t i = 0; i < p->startup_modules.size(); ++i) {
+      fprintf(pf, "%s\"%s\"", i ? ", " : "", json_escape(p->startup_modules[i]).c_str());
+    }
+    fprintf(pf, "],\n");
+  }
+  fprintf(pf, "  \"graphics_from_delay_imports\": %s,\n",
+          p->graphics_from_delay_imports ? "true" : "false");
   fprintf(pf, "  \"shims\": [");
   for (size_t i = 0; i < p->synthetic_shims.size(); ++i) {
     fprintf(pf, "%s\"%s\"", i ? ", " : "", json_escape(p->synthetic_shims[i]).c_str());
@@ -379,6 +389,7 @@ struct pe_scan {
   uint16_t subsystem = 0;
   uint16_t machine = 0;
   std::vector<std::string> modules;  // lower-case, unique, sorted
+  std::vector<std::string> startup_modules;
 };
 
 struct file_range {
@@ -478,6 +489,11 @@ bool scan_pe_file(const std::string& path, pe_scan* out) {
     if (!desc.name && !desc.original_first_thunk && !desc.first_thunk) break;
     add_module(desc.name);
   }
+  std::sort(out->modules.begin(), out->modules.end());
+  out->modules.erase(std::unique(out->modules.begin(), out->modules.end()),
+                     out->modules.end());
+  out->startup_modules = out->modules;
+
   const file_range delays = directory(TRT_PE_DIR_DELAY_IMPORT);
   const size_t delay_count = std::min<uint64_t>(256,
       delays.length / sizeof(trt_delayload_descriptor));
@@ -688,10 +704,14 @@ std::string parent_directory(const std::string& path) {
   return separator == std::string::npos ? std::string() : path.substr(0, separator);
 }
 
-std::vector<std::string> collect_launch_imports(const std::string& game_dir,
-                                                const std::string& executable,
-                                                const pe_scan& main,
-                                                const std::vector<std::string>& files) {
+struct launch_imports {
+  std::vector<std::string> all, startup;
+};
+
+launch_imports collect_launch_imports(const std::string& game_dir,
+                                      const std::string& executable,
+                                      const pe_scan& main,
+                                      const std::vector<std::string>& files) {
   const auto exe_dir = lower_str(parent_directory(executable));
   std::unordered_map<std::string, const std::string*> dll_paths;
   for (const auto& file : files) {
@@ -702,38 +722,54 @@ std::vector<std::string> collect_launch_imports(const std::string& game_dir,
     if (!added && file < *existing->second) existing->second = &file;
   }
 
-  std::unordered_set<std::string> modules;
+  std::unordered_set<std::string> modules, startup_modules, visited_files;
   using pending_imports = std::pair<std::vector<std::string>, std::string>;
-  std::deque<pending_imports> pending{{main.modules, exe_dir}};
+  std::deque<pending_imports> startup, deferred;
+  const auto enqueue = [&](pe_scan image, const std::string& directory, bool required) {
+    if (!required) {
+      deferred.emplace_back(std::move(image.modules), directory);
+      return;
+    }
+    std::vector<std::string> delay;
+    std::set_difference(image.modules.begin(), image.modules.end(),
+                        image.startup_modules.begin(), image.startup_modules.end(),
+                        std::back_inserter(delay));
+    if (!delay.empty()) deferred.emplace_back(std::move(delay), directory);
+    startup.emplace_back(std::move(image.startup_modules), directory);
+  };
+  enqueue(main, exe_dir, true);
   size_t remaining = 64;
-  // Follow the runtime's import search: current DLL directory, then the
-  // executable directory, then the mounted game root. Bound disk work and
-  // let the nearest dependencies take priority when a title has many DLLs.
-  while (!pending.empty()) {
-    auto [imports, importer_dir] = std::move(pending.front());
-    pending.pop_front();
+  // Exhaust the ordinary import graph first. Every edge from a delayed DLL
+  // is optional, even if the child import is ordinary within that DLL.
+  while (!startup.empty() || !deferred.empty()) {
+    const bool required = !startup.empty();
+    auto& queue = required ? startup : deferred;
+    auto [imports, importer_dir] = std::move(queue.front());
+    queue.pop_front();
     for (const auto& module : imports) {
-      if (!modules.insert(module).second || !remaining ||
-          module.find_first_of("/\\:") != std::string::npos ||
+      modules.insert(module);
+      if (required) startup_modules.insert(module);
+      if (!remaining || module.find_first_of("/\\:") != std::string::npos ||
           module == "steam_api.dll" || module == "steam_api64.dll") continue;
       auto candidate = dll_paths.find(path_join(importer_dir, module));
-      if (candidate == dll_paths.end())
-        candidate = dll_paths.find(path_join(exe_dir, module));
+      if (candidate == dll_paths.end()) candidate = dll_paths.find(path_join(exe_dir, module));
       if (candidate == dll_paths.end()) candidate = dll_paths.find(module);
       if (candidate == dll_paths.end()) continue;
-      --remaining;
 
-      pe_scan dependency;
       const auto& relative = *candidate->second;
+      if (!visited_files.insert(relative).second) continue;
+      --remaining;
+      pe_scan dependency;
       if (scan_pe_file(path_join(game_dir, relative), &dependency) &&
           dependency.machine == main.machine && dependency.is_pe32 == main.is_pe32) {
-        pending.emplace_back(std::move(dependency.modules),
-                             lower_str(parent_directory(relative)));
+        enqueue(std::move(dependency), lower_str(parent_directory(relative)), required);
       }
     }
   }
-  std::vector<std::string> result(modules.begin(), modules.end());
-  std::sort(result.begin(), result.end());
+  launch_imports result{
+      {modules.begin(), modules.end()}, {startup_modules.begin(), startup_modules.end()}};
+  std::sort(result.all.begin(), result.all.end());
+  std::sort(result.startup.begin(), result.startup.end());
   return result;
 }
 
@@ -825,37 +861,18 @@ int trt_pe_scan_import_modules(const char* path, char* out_csv, size_t cap) {
   return (int)scan.modules.size();
 }
 
-static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
-                              trt_engine_profile* out_profile, bool exact) {
-  if (!game_dir || !game_dir[0] || !out_profile) return false;
-  *out_profile = {};
-
-  std::string base_dir = game_dir;
-  // Clean trailing separator
-  while (base_dir.size() > 1 && (base_dir.back() == '/' || base_dir.back() == '\\')) {
-    base_dir.pop_back();
-
-  // Extract base game name
-  }
-  std::string game_name;
-  size_t last_slash = base_dir.find_last_of("/\\");
-  if (last_slash != std::string::npos) {
-    game_name = base_dir.substr(last_slash + 1);
-  } else {
-    game_name = base_dir;
-
-  }
-  out_profile->game_name = game_name;
-  out_profile->game_dir = base_dir;
-
-  const std::string hint = normalize_exe_hint(target_exe_hint ? target_exe_hint : "");
+static bool select_guest_executable(const std::string& base_dir,
+                                    const std::string& game_name,
+                                    const std::string& hint, bool exact,
+                                    std::vector<std::string>* all_files,
+                                    exe_candidate* chosen, pe_scan* scan,
+                                    std::string* rejected) {
   const std::string hint_lower = lower_str(hint);
 
   // Directory launches search the bundle for candidates. An exact file
   // only needs its sibling DLLs and the engine payload checks below.
   std::vector<exe_candidate> exes;
-  std::vector<std::string> all_files;
-  scan_dir_recursive(base_dir, "", 0, exact ? 0 : 5, &exes, &all_files);
+  scan_dir_recursive(base_dir, "", 0, exact ? 0 : 5, &exes, all_files);
 
   // If a target executable hint was provided, ensure it is considered even if
   // directory recursion missed it or truncated early.
@@ -915,22 +932,72 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
   // must not hide the real game binary behind it, and an exe that is not a PE
   // at all is refused by name instead of being guessed as PE64 (that guess
   // used to reach the loader as a wrong-arch launch).
-  pe_scan scan;
-  exe_candidate chosen;
-  bool scanned = false;
-  std::string rejected;
   for (const auto& cand : exes) {
     if (exact && cand.rel_path != hint) continue;
     pe_scan s;
     if (scan_pe_file(cand.full_path, &s) && s.is_guest_exe) {
-      chosen = cand;
-      scan = s;
-      scanned = true;
-      break;
+      *chosen = cand;
+      *scan = std::move(s);
+      return true;
     }
-    rejected += (rejected.empty() ? "" : ", ") + cand.rel_path;
+    if (rejected) *rejected += (rejected->empty() ? "" : ", ") + cand.rel_path;
   }
-  if (!scanned) {
+  return false;
+}
+
+bool trt_find_guest_executable(const char* game_dir, const char* relative_exe,
+                               std::string* selected) {
+  if (!game_dir || !game_dir[0] || !selected) return false;
+  selected->clear();
+  const std::string base = game_dir;
+  const auto last = base.find_last_of("/\\");
+  const auto game_name = last == std::string::npos ? base : base.substr(last + 1);
+  const std::string hint = normalize_exe_hint(relative_exe ? relative_exe : "");
+  if (relative_exe && (hint.empty() || !ends_with_ci(hint, ".exe"))) return false;
+  if (!hint.empty()) {
+    pe_scan scan;
+    if (!scan_pe_file(path_join(base, hint), &scan) || !scan.is_guest_exe) return false;
+    *selected = hint;
+    return true;
+  }
+  exe_candidate chosen;
+  pe_scan scan;
+  if (!select_guest_executable(base, game_name, {}, false, nullptr, &chosen,
+                               &scan, nullptr)) return false;
+  *selected = chosen.rel_path;
+  return true;
+}
+
+static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
+                              trt_engine_profile* out_profile, bool exact) {
+  if (!game_dir || !game_dir[0] || !out_profile) return false;
+  *out_profile = {};
+
+  std::string base_dir = game_dir;
+  // Clean trailing separator
+  while (base_dir.size() > 1 && (base_dir.back() == '/' || base_dir.back() == '\\')) {
+    base_dir.pop_back();
+
+  // Extract base game name
+  }
+  std::string game_name;
+  size_t last_slash = base_dir.find_last_of("/\\");
+  if (last_slash != std::string::npos) {
+    game_name = base_dir.substr(last_slash + 1);
+  } else {
+    game_name = base_dir;
+
+  }
+  out_profile->game_name = game_name;
+  out_profile->game_dir = base_dir;
+
+  const std::string hint = normalize_exe_hint(target_exe_hint ? target_exe_hint : "");
+  std::vector<std::string> all_files;
+  pe_scan scan;
+  exe_candidate chosen;
+  std::string rejected;
+  if (!select_guest_executable(base_dir, game_name, hint, exact, &all_files,
+                               &chosen, &scan, &rejected)) {
     char line[900];
     if (rejected.empty())
       snprintf(line, sizeof(line),
@@ -961,8 +1028,10 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
       scan_dir_recursive(base_dir, launch_dir, 0, 0, &ignored, &all_files);
     }
   }
-  out_profile->imported_modules =
-      collect_launch_imports(base_dir, chosen.rel_path, scan, all_files);
+  auto imports = collect_launch_imports(base_dir, chosen.rel_path, scan, all_files);
+  out_profile->imported_modules = std::move(imports.all);
+  out_profile->startup_modules = std::move(imports.startup);
+  out_profile->import_roles_scanned = true;
   auto mod_is = [&](const char* name) {
     const std::string want = lower_str(name);
     return std::binary_search(out_profile->imported_modules.begin(),
@@ -1080,15 +1149,26 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
     out_profile->universal_flags |= TRT_UNIV_CLEAR_PC;  // PC games: universal-first
   }
 
-  // 5. Graphics API from the real imports. Engines whose mature Tiramisu path
-  //    is D3D11 keep it when the binary imports d3d11, even if d3d12 is also
-  //    linked in for a SM6 path. DXGI is shared by both renderers.
-  const bool imp_d12 = mod_is("d3d12.dll");
-  const bool imp_d11 = mod_is("d3d11.dll") || mod_is("d3d10_1.dll") ||
-                       mod_is("d3d10.dll");
-  const bool imp_d9 = mod_is("d3d9.dll") || mod_is("d3d8.dll") || mod_is("ddraw.dll");
-  const bool imp_vk = mod_is("vulkan-1.dll");
-  const bool imp_gl = mod_is("opengl32.dll");
+  // Prefer renderer imports in the startup graph. Delay-loaded providers
+  // remain visible as hints when startup imports make no renderer choice.
+  struct renderer_imports {
+    bool d12, d11, d9, vulkan, gl;
+    bool any() const { return d12 || d11 || d9 || vulkan || gl; }
+  };
+  auto renderer_for = [](const std::vector<std::string>& modules) {
+    auto has = [&](const char* name) {
+      return std::binary_search(modules.begin(), modules.end(), name);
+    };
+    return renderer_imports{has("d3d12.dll"),
+        has("d3d11.dll") || has("d3d10_1.dll") || has("d3d10.dll"),
+        has("d3d9.dll") || has("d3d8.dll") || has("ddraw.dll"),
+        has("vulkan-1.dll"), has("opengl32.dll")};
+  };
+  const auto startup_renderer = renderer_for(out_profile->startup_modules);
+  const auto all_renderers = renderer_for(out_profile->imported_modules);
+  out_profile->graphics_from_delay_imports = !startup_renderer.any() && all_renderers.any();
+  const auto [imp_d12, imp_d11, imp_d9, imp_vk, imp_gl] =
+      startup_renderer.any() ? startup_renderer : all_renderers;
 
   const bool prefer_d3d11 = out_profile->engine_type == TRT_ENGINE_UNITY_IL2CPP ||
                             out_profile->engine_type == TRT_ENGINE_UNITY_MONO ||
@@ -1129,17 +1209,6 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
     out_profile->preferred_gfx = TRT_GFX_D3D11; // bridge default
   }
 
-  // 5b. Universal guest prefers its own abstracted graphics path by default
-  //     (the universal guest is the "one engine"; PC imports translate in the
-  //     host/guest at launch, not in the engine profile).
-  if (out_profile->engine_type == TRT_ENGINE_UNIVERSAL) {
-    if (imp_d11) out_profile->preferred_gfx = TRT_GFX_D3D11;
-    else if (imp_d12) out_profile->preferred_gfx = TRT_GFX_D3D12;
-    else if (imp_vk) out_profile->preferred_gfx = TRT_GFX_VULKAN;
-    else if (imp_d9) out_profile->preferred_gfx = TRT_GFX_D3D9;
-    else if (imp_gl) out_profile->preferred_gfx = TRT_GFX_OPENGL;
-  }
-
   // 6. Audio middleware from the real imports.
   const bool imp_fmod = mod_is("fmod.dll") || mod_is("fmod64.dll") ||
                         mod_is("fmodstudio.dll") || mod_is("fmodstudio64.dll") ||
@@ -1172,7 +1241,8 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
   switch (out_profile->engine_type) {
     case TRT_ENGINE_UNITY_IL2CPP:
     case TRT_ENGINE_UNITY_MONO:
-      if (out_profile->preferred_gfx == TRT_GFX_D3D11)
+      if (!out_profile->graphics_from_delay_imports &&
+          out_profile->preferred_gfx == TRT_GFX_D3D11)
         out_profile->cmdline_args.push_back("-force-d3d11");
       out_profile->cmdline_args.push_back("-screen-width");
       out_profile->cmdline_args.push_back(sw);
@@ -1188,6 +1258,7 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
       out_profile->cmdline_args.push_back("-ResX=" + sw);
       out_profile->cmdline_args.push_back("-ResY=" + sh);
       out_profile->cmdline_args.push_back("-NoVerifyGC");
+      if (out_profile->graphics_from_delay_imports) break;
       if (out_profile->preferred_gfx == TRT_GFX_D3D12) {
         out_profile->cmdline_args.push_back("-d3d12");
       } else if (out_profile->preferred_gfx == TRT_GFX_VULKAN) {
@@ -1624,36 +1695,42 @@ extern "C" int trt_engine_launch_preflight(const trt_engine_profile* prof,
   }
 
   // 4. Is the chosen graphics API executed or only recorded?
+  auto graphics_unavailable = [&](unsigned bit, const char* reason) {
+    if (prof->graphics_from_delay_imports)
+      note(std::string("Delay-loaded graphics hint: ") + reason);
+    else
+      block(bit, reason);
+  };
   switch (prof->preferred_gfx) {
     case TRT_GFX_D3D11:
       if (!c->d3d11_device)
-        block(TRT_PRE_NO_GFX_DEVICE,
+        graphics_unavailable(TRT_PRE_NO_GFX_DEVICE,
               "D3D11 selected but no host device exists: D3D11CreateDevice "
               "returns DXGI_ERROR_UNSUPPORTED at the first call");
       break;
     case TRT_GFX_D3D9:
       if (!c->d3d11_device)
-        block(TRT_PRE_NO_GFX_DEVICE,
+        graphics_unavailable(TRT_PRE_NO_GFX_DEVICE,
               "D3D9 selected: it draws through the D3D11 host, which has no device");
       break;
     case TRT_GFX_VULKAN:
       if (!c->d3d11_device)
-        block(TRT_PRE_NO_GFX_DEVICE,
+        graphics_unavailable(TRT_PRE_NO_GFX_DEVICE,
               "Vulkan selected: it is translated onto D3D11, which has no host device");
       break;
     case TRT_GFX_D3D12:
       if (!c->d3d12_device)
-        block(TRT_PRE_GFX_NOT_EXECUTED,
+        graphics_unavailable(TRT_PRE_GFX_NOT_EXECUTED,
               "D3D12 selected: command lists are recorded, not submitted - "
               "nothing is drawn");
       break;
     case TRT_GFX_OPENGL:
       if (!c->opengl_renderer)
-        block(TRT_PRE_GFX_NOT_EXECUTED,
+        graphics_unavailable(TRT_PRE_GFX_NOT_EXECUTED,
               "OpenGL selected but the WGL bridge has no active render backend");
       break;
     default:
-      block(TRT_PRE_NO_GFX_DEVICE, "no graphics API could be resolved for this title");
+      graphics_unavailable(TRT_PRE_NO_GFX_DEVICE, "no graphics API could be resolved for this title");
       break;
   }
   if (!c->compositor) {
@@ -1666,7 +1743,7 @@ extern "C" int trt_engine_launch_preflight(const trt_engine_profile* prof,
 
   // 5. Anti-cheat and known stub routes. A missing route can still resolve
   //    through the guest's own DLLs or an available host provider.
-  std::vector<std::string> ac, stub_core;
+  std::vector<std::string> ac, stub_core, optional_stubs;
   auto on_disk = [&](const std::string& m) {
     for (const std::string* dir : {&prof->game_dir}) {
       if (!dir || dir->empty()) continue;
@@ -1691,7 +1768,12 @@ extern "C" int trt_engine_launch_preflight(const trt_engine_profile* prof,
     }
     if (trt_module_route(m.c_str()) != TRT_ROUTE_STUB) continue;
     if (on_disk(m)) continue;  // the game's own binary, never a stub
-    if (preflight_core_module(m.c_str())) stub_core.push_back(m);
+    if (!preflight_core_module(m.c_str())) continue;
+    if (prof->import_roles_scanned &&
+        !std::binary_search(prof->startup_modules.begin(), prof->startup_modules.end(), m))
+      optional_stubs.push_back(m);
+    else
+      stub_core.push_back(m);
   }
   if (!ac.empty()) {
     block(TRT_PRE_ANTI_CHEAT,
@@ -1703,6 +1785,9 @@ extern "C" int trt_engine_launch_preflight(const trt_engine_profile* prof,
           "graphics/audio imports bind to stubs (" + join(stub_core, 4) +
               "): their calls answer zero instead of drawing or playing");
   }
+  if (!optional_stubs.empty())
+    note("delay-loaded graphics/audio imports have only stub providers (" +
+         join(optional_stubs, 4) + ")");
   // Non-graphics modules registered as stubs are deliberately not listed: the
   // OS surface (advapi32/user32/ws2_32) is registered by the host's own bridge
   // pass, and naming it here would blame a stub for a module that is served.
