@@ -3,6 +3,7 @@
 #include "crash_report.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -11,6 +12,7 @@
 #if defined(_WIN32)
 #include <direct.h>
 #include <io.h>
+#include <windows.h>
 #else
 #include <dirent.h>
 #include <sys/stat.h>
@@ -160,6 +162,82 @@ int crash_report_trim(const std::string& local_state, int keep) {
     if (remove(p.c_str()) == 0) ++removed;
   }
   return removed;
+}
+
+static bool write_checkpoint(const std::string& local_state, const char* filename,
+                             const launch_checkpoint& report,
+                             std::atomic_flag& writer) noexcept {
+  // A fatal error may interrupt a normal checkpoint write. Keep the last
+  // complete checkpoint readable and avoid blocking the exception handler.
+  if (local_state.empty() || writer.test_and_set()) return false;
+  struct release_writer {
+    std::atomic_flag& value;
+    ~release_writer() { value.clear(); }
+  } release{writer};
+  try {
+    const std::string path = local_state + k_sep + filename;
+    const std::string temporary = path + ".tmp";
+    FILE* file = fopen(temporary.c_str(), "wb");
+    if (!file) return false;
+    const uint32_t fields[] = {0x31524354u, static_cast<uint32_t>(report.phase),
+                              static_cast<uint32_t>(report.outcome), report.code};
+    const bool written = fwrite(fields, sizeof(fields), 1, file) == 1;
+    const bool closed = fclose(file) == 0;
+    if (written && closed) {
+#ifdef _WIN32
+      if (MoveFileExA(temporary.c_str(), path.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+#else
+      if (rename(temporary.c_str(), path.c_str()) == 0) return true;
+#endif
+    }
+    remove(temporary.c_str());
+  } catch (...) {}
+  return false;
+}
+
+static bool read_checkpoint(const std::string& local_state, const char* filename,
+                            launch_checkpoint* report) noexcept {
+  if (local_state.empty() || !report) return false;
+  try {
+    const std::string path = local_state + k_sep + filename;
+    FILE* file = fopen(path.c_str(), "rb");
+    if (!file) return false;
+    uint32_t fields[4]{};
+    const bool read = fread(fields, sizeof(fields), 1, file) == 1;
+    const bool exact = fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!read || !exact || fields[0] != 0x31524354u ||
+        fields[1] > static_cast<uint32_t>(launch_phase::managed_runtime) ||
+        fields[2] > static_cast<uint32_t>(launch_outcome::host_exit)) return false;
+    *report = {static_cast<launch_phase>(fields[1]),
+               static_cast<launch_outcome>(fields[2]), fields[3]};
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool launch_checkpoint_write(const std::string& local_state,
+                             const launch_checkpoint& report) noexcept {
+  static std::atomic_flag writer = ATOMIC_FLAG_INIT;
+  return write_checkpoint(local_state, "launch-checkpoint.bin", report, writer);
+}
+
+bool launch_checkpoint_read(const std::string& local_state,
+                            launch_checkpoint* report) noexcept {
+  return read_checkpoint(local_state, "launch-checkpoint.bin", report);
+}
+
+bool launch_worker_fault_write(const std::string& local_state,
+                               const launch_checkpoint& report) noexcept {
+  static std::atomic_flag writer = ATOMIC_FLAG_INIT;
+  return write_checkpoint(local_state, "launch-worker-fault.bin", report, writer);
+}
+
+bool launch_worker_fault_read(const std::string& local_state,
+                              launch_checkpoint* report) noexcept {
+  return read_checkpoint(local_state, "launch-worker-fault.bin", report);
 }
 
 }  // namespace longan
