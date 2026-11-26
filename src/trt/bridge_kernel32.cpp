@@ -6224,6 +6224,15 @@ void TRT_STDCALL trt_RtlUnwind(u64 target, u64 target_ip, void* exrec,
 
 extern "C" int trt_run_guest_veh(void* ep) {
   if (!ep) return 0;
+
+  // Match the Linux dispatcher when a guest handler itself faults. The
+  // host exception chain can still handle the fault after the third dispatch.
+  static thread_local unsigned depth = 0;
+  if (depth >= 3) return 0;
+  struct dispatch_scope {
+    unsigned& depth;
+    ~dispatch_scope() { --depth; }
+  } scope{++depth};
   std::vector<void*> vehs;
   veh_snapshot_ordered(&vehs);
   for (void* vfn : vehs) {
