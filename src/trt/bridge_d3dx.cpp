@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 
 extern "C" {
 
@@ -498,6 +499,197 @@ int TRT_GUEST_ABI dx11_SaveTextureToFileA(void* ctx, void* res, u32 fmt, const c
   return 0;
 }
 
+namespace {
+
+struct d3dx_blob {
+  const void** vtbl;
+  std::atomic<u32> refcount;
+  size_t size;
+  u8* data;
+};
+
+int TRT_GUEST_ABI d3dx_blob_qi(void* self, const void* riid, void** ppv) {
+  (void)riid;
+  if (!ppv) return k_e_invalidarg;
+  *ppv = self;
+  ((d3dx_blob*)self)->refcount.fetch_add(1, std::memory_order_relaxed);
+  return 0;
+}
+
+u32 TRT_GUEST_ABI d3dx_blob_addref(void* self) {
+  return ((d3dx_blob*)self)->refcount.fetch_add(1, std::memory_order_relaxed) + 1u;
+}
+
+u32 TRT_GUEST_ABI d3dx_blob_release(void* self) {
+  auto* b = (d3dx_blob*)self;
+  const u32 r = b->refcount.fetch_sub(1, std::memory_order_acq_rel) - 1u;
+  if (r == 0) {
+    free(b->data);
+    delete b;
+  }
+  return r;
+}
+
+void* TRT_GUEST_ABI d3dx_blob_ptr(void* self) {
+  return ((d3dx_blob*)self)->data;
+}
+
+size_t TRT_GUEST_ABI d3dx_blob_size(void* self) {
+  return ((d3dx_blob*)self)->size;
+}
+
+const void* k_d3dx_blob_vtbl[5] = {
+    (const void*)&d3dx_blob_qi,
+    (const void*)&d3dx_blob_addref,
+    (const void*)&d3dx_blob_release,
+    (const void*)&d3dx_blob_ptr,
+    (const void*)&d3dx_blob_size,
+};
+
+d3dx_blob* alloc_d3dx_blob(const void* bytes, size_t size) {
+  auto* b = new d3dx_blob();
+  b->vtbl = k_d3dx_blob_vtbl;
+  b->refcount.store(1u, std::memory_order_relaxed);
+  b->size = size;
+  b->data = nullptr;
+  if (size > 0) {
+    b->data = (u8*)malloc(size);
+    if (!b->data) {
+      delete b;
+      return nullptr;
+    }
+    if (bytes) memcpy(b->data, bytes, size);
+    else memset(b->data, 0, size);
+  }
+  return b;
+}
+
+constexpr u32 make_fourcc(char a, char b, char c, char d) {
+  return (u32)(u8)a | ((u32)(u8)b << 8) | ((u32)(u8)c << 16) | ((u32)(u8)d << 24);
+}
+
+bool match_blob_part(u32 part, u32 fourcc) {
+  switch (part) {
+    case 0: return fourcc == make_fourcc('I','S','G','N') || fourcc == make_fourcc('I','S','G','1');
+    case 1: return fourcc == make_fourcc('O','S','G','N') || fourcc == make_fourcc('O','S','G','1');
+    case 2: return fourcc == make_fourcc('I','O','S','G');
+    case 3: return fourcc == make_fourcc('P','C','S','G');
+    case 4: return fourcc == make_fourcc('O','S','G','5');
+    case 5:
+    case 9: return fourcc == make_fourcc('S','P','D','B');
+    case 6: return fourcc == make_fourcc('S','H','D','R') || fourcc == make_fourcc('S','H','E','X');
+    case 10: return fourcc == make_fourcc('P','R','I','V');
+    case 11: return fourcc == make_fourcc('R','T','S','0');
+    case 12: return fourcc == make_fourcc('I','L','D','N');
+    default: return false;
+  }
+}
+
+}  // namespace
+
+int TRT_GUEST_ABI trt_D3DCreateBlob(size_t size, void** out_blob) {
+  if (!out_blob) return k_e_invalidarg;
+  *out_blob = nullptr;
+  d3dx_blob* b = alloc_d3dx_blob(nullptr, size);
+  if (!b) return (int)0x8007000Eu;  // E_OUTOFMEMORY
+  *out_blob = b;
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_D3DGetBlobPart(const void* src_data, size_t src_size,
+                                     u32 part, u32 flags, void** out_part) {
+  (void)flags;
+  if (!out_part) return k_e_invalidarg;
+  *out_part = nullptr;
+  if (!src_data || src_size < 32) return k_e_invalidarg;
+  const u8* p = (const u8*)src_data;
+  if (p[0] != 'D' || p[1] != 'X' || p[2] != 'B' || p[3] != 'C') return k_e_fail;
+  u32 chunk_count = 0;
+  memcpy(&chunk_count, p + 28, sizeof(chunk_count));
+  if (chunk_count > 64 || 32u + (size_t)chunk_count * 4u > src_size) return k_e_fail;
+  for (u32 i = 0; i < chunk_count; ++i) {
+    u32 off = 0;
+    memcpy(&off, p + 32u + (size_t)i * 4u, sizeof(off));
+    if ((size_t)off + 8u > src_size) continue;
+    u32 fourcc = 0, csize = 0;
+    memcpy(&fourcc, p + off, 4);
+    memcpy(&csize, p + off + 4u, 4);
+    if ((size_t)off + 8u + (size_t)csize > src_size) continue;
+    if (match_blob_part(part, fourcc)) {
+      d3dx_blob* b = alloc_d3dx_blob(p + off + 8u, csize);
+      if (!b) return (int)0x8007000Eu;
+      *out_part = b;
+      return 0;
+    }
+  }
+  return k_e_fail;
+}
+
+int TRT_GUEST_ABI trt_D3DStripShader(const void* bytecode, size_t length,
+                                     u32 strip_flags, void** out_stripped) {
+  if (!out_stripped) return k_e_invalidarg;
+  *out_stripped = nullptr;
+  if (!bytecode || length < 32) return k_e_invalidarg;
+  const u8* p = (const u8*)bytecode;
+  if (p[0] != 'D' || p[1] != 'X' || p[2] != 'B' || p[3] != 'C') return k_e_fail;
+  u32 chunk_count = 0;
+  memcpy(&chunk_count, p + 28, sizeof(chunk_count));
+  if (chunk_count > 64 || 32u + (size_t)chunk_count * 4u > length) return k_e_fail;
+
+  // Flags (d3dcompiler.h): 1=REFLECTION(RDEF/STAT/RD11), 2=DEBUG_INFO(SPDB/ILDN),
+  // 4=TEST_BLOBS(SDBG/Aon9), 8=PRIVATE_DATA(PRIV)
+  u32 keep_idx[64];
+  u32 keep_cnt = 0;
+  size_t payload_bytes = 0;
+  for (u32 i = 0; i < chunk_count; ++i) {
+    u32 off = 0;
+    memcpy(&off, p + 32u + (size_t)i * 4u, sizeof(off));
+    if ((size_t)off + 8u > length) continue;
+    u32 fourcc = 0, csize = 0;
+    memcpy(&fourcc, p + off, 4);
+    memcpy(&csize, p + off + 4u, 4);
+    if ((size_t)off + 8u + (size_t)csize > length) continue;
+    const bool strip =
+        ((strip_flags & 1u) && (fourcc == make_fourcc('R','D','E','F') ||
+                                fourcc == make_fourcc('S','T','A','T') ||
+                                fourcc == make_fourcc('R','D','1','1'))) ||
+        ((strip_flags & 2u) && (fourcc == make_fourcc('S','P','D','B') ||
+                                fourcc == make_fourcc('I','L','D','N'))) ||
+        ((strip_flags & 4u) && (fourcc == make_fourcc('S','D','B','G'))) ||
+        ((strip_flags & 8u) && (fourcc == make_fourcc('P','R','I','V')));
+    if (!strip) {
+      keep_idx[keep_cnt++] = off;
+      payload_bytes += 8u + (size_t)csize;
+    }
+  }
+  if (keep_cnt == chunk_count) {
+    d3dx_blob* b = alloc_d3dx_blob(bytecode, length);
+    if (!b) return (int)0x8007000Eu;
+    *out_stripped = b;
+    return 0;
+  }
+  const size_t hdr_bytes = 32u + (size_t)keep_cnt * 4u;
+  const size_t total = hdr_bytes + payload_bytes;
+  d3dx_blob* b = alloc_d3dx_blob(nullptr, total);
+  if (!b) return (int)0x8007000Eu;
+  memcpy(b->data, p, 24);  // DXBC + digest + version
+  const u32 total_u32 = (u32)total;
+  memcpy(b->data + 24, &total_u32, 4);
+  memcpy(b->data + 28, &keep_cnt, 4);
+  size_t cursor = hdr_bytes;
+  for (u32 i = 0; i < keep_cnt; ++i) {
+    const u32 old_off = keep_idx[i];
+    u32 csize = 0;
+    memcpy(&csize, p + old_off + 4u, 4);
+    const u32 new_off = (u32)cursor;
+    memcpy(b->data + 32u + (size_t)i * 4u, &new_off, 4);
+    memcpy(b->data + cursor, p + old_off, 8u + (size_t)csize);
+    cursor += 8u + (size_t)csize;
+  }
+  *out_stripped = b;
+  return 0;
+}
+
 const trt_named_fn k_d3dx_fns[] = {
     {"D3DX11SaveTextureToFileW", (void*)&dx11_SaveTextureToFileW},
     {"D3DX11SaveTextureToFileA", (void*)&dx11_SaveTextureToFileA},
@@ -543,6 +735,18 @@ int trt_bridge_register_d3dx(void) {
                       (int)(sizeof(k_d3dx_fns) / sizeof(k_d3dx_fns[0])));
   trt_module_register("d3dx10_33.dll", TRT_ROUTE_BUILTIN, k_d3dx_fns,
                       (int)(sizeof(k_d3dx_fns) / sizeof(k_d3dx_fns[0])));
+  // d3dcompiler fallback surface (registered TRT_ROUTE_SYSTEM so console OS
+  // d3dcompiler_47 is preferred when present, falling back to real DXBC parsing
+  // when offline or when a desktop export is absent on UWP)
+  static const trt_named_fn k_d3dcompiler_fns[] = {
+      {"D3DCreateBlob", (void*)&trt_D3DCreateBlob},
+      {"D3DGetBlobPart", (void*)&trt_D3DGetBlobPart},
+      {"D3DStripShader", (void*)&trt_D3DStripShader},
+  };
+  const int n_comp = (int)(sizeof(k_d3dcompiler_fns) / sizeof(k_d3dcompiler_fns[0]));
+  trt_module_register("d3dcompiler_47.dll", TRT_ROUTE_SYSTEM, k_d3dcompiler_fns, n_comp);
+  trt_module_register("d3dcompiler_46.dll", TRT_ROUTE_SYSTEM, k_d3dcompiler_fns, n_comp);
+  trt_module_register("d3dcompiler_43.dll", TRT_ROUTE_SYSTEM, k_d3dcompiler_fns, n_comp);
   return 0;
 }
 

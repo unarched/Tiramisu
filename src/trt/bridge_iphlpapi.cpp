@@ -10,6 +10,7 @@
 #include "trt.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace {
@@ -195,11 +196,53 @@ u32 TRT_GUEST_ABI iphlp_if_nametoindex(const char* ifname) {
   return 0;  // 0 = interface not found
 }
 
+u32 TRT_GUEST_ABI iphlp_GetIpAddrTable(void* table, u32* size, int order) {
+  (void)order;
+  if (!size) return k_err_invalid_parameter;
+  // MIB_IPADDRTABLE { DWORD dwNumEntries; MIB_IPADDRROW table[1]; } = 28 bytes min
+  const u32 need = 28u;
+  if (!table || *size < need) {
+    *size = need;
+    return 122u;  // ERROR_INSUFFICIENT_BUFFER
+  }
+  memset(table, 0, need);
+  u8* p = (u8*)table;
+  *(u32*)(p + 0) = 1u;              // dwNumEntries
+  *(u32*)(p + 4) = 0x0100007Fu;     // dwAddr = 127.0.0.1 (network byte order)
+  *(u32*)(p + 8) = 1u;              // dwIndex = 1
+  *(u32*)(p + 12) = 0x000000FFu;    // dwMask = 255.0.0.0
+  *(u32*)(p + 16) = 0xFF00007Fu;    // dwBCastAddr = 127.255.255.255
+  *(u32*)(p + 20) = 65535u;         // dwReasmSize
+  *(u16*)(p + 24) = 1u;             // wType = MIB_IPADDR_PRIMARY
+  *size = need;
+  return 0u;  // NO_ERROR
+}
+
+void TRT_GUEST_ABI dns_DnsFree(void* data, u32 free_type) {
+  (void)data;
+  (void)free_type;
+}
+
+u32 TRT_GUEST_ABI dns_DnsQuery_A(const char* name, u16 type, u32 opts, void* extra,
+                                 void** results, void* reserved) {
+  (void)name; (void)type; (void)opts; (void)extra; (void)reserved;
+  if (results) *results = nullptr;
+  return 9003u;  // DNS_ERROR_RCODE_NAME_ERROR (honest offline NXDOMAIN)
+}
+
+u32 TRT_GUEST_ABI dns_DnsQuery_W(const u16* name, u16 type, u32 opts, void* extra,
+                                 void** results, void* reserved) {
+  (void)name; (void)type; (void)opts; (void)extra; (void)reserved;
+  if (results) *results = nullptr;
+  return 9003u;
+}
+
 int trt_bridge_register_iphlpapi(void) {
   static const trt_named_fn k_fns[] = {
       {"GetAdaptersInfo", (void*)&iphlp_GetAdaptersInfo},
       {"GetAdaptersAddresses", (void*)&iphlp_GetAdaptersAddresses},
       {"GetIfTable", (void*)&iphlp_GetIfTable},
+      {"GetIpAddrTable", (void*)&iphlp_GetIpAddrTable},
       {"GetNetworkParams", (void*)&iphlp_GetNetworkParams},
       {"GetIfEntry", (void*)&iphlp_GetIfEntry},
       {"IcmpCreateFile", (void*)&iphlp_IcmpCreateFile},
@@ -210,6 +253,15 @@ int trt_bridge_register_iphlpapi(void) {
   };
   trt_module_register("iphlpapi.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));
+  static const trt_named_fn k_dns_fns[] = {
+      {"DnsFree", (void*)&dns_DnsFree},
+      {"DnsRecordListFree", (void*)&dns_DnsFree},
+      {"DnsQuery_A", (void*)&dns_DnsQuery_A},
+      {"DnsQuery_W", (void*)&dns_DnsQuery_W},
+      {"DnsQuery_UTF8", (void*)&dns_DnsQuery_A},
+  };
+  trt_module_register("dnsapi.dll", TRT_ROUTE_BUILTIN, k_dns_fns,
+                      (int)(sizeof(k_dns_fns) / sizeof(k_dns_fns[0])));
   return 0;
 }
 

@@ -253,6 +253,8 @@ int main() {
     std::string test_dir = "tests/out/test_synth_unity";
     mkdir("tests/out", 0755);
     mkdir(test_dir.c_str(), 0755);
+    unlink((test_dir + "/steam_appid.txt").c_str());
+    unlink((test_dir + "/steam_emu.ini").c_str());
 
     // Create Unity IL2CPP file signatures
     make_fake_pe(test_dir + "/Game.exe", 0x20b); // PE64

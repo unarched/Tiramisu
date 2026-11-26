@@ -2035,6 +2035,12 @@ u32 TRT_STDCALL trt_CharLowerBuffW(u16* lpsz, u32 cchLength) {
     if (lpsz[i] >= 'A' && lpsz[i] <= 'Z') lpsz[i] = (u16)(lpsz[i] - 'A' + 'a');
   return cchLength;
 }
+u32 TRT_STDCALL trt_CharLowerBuffA(char* lpsz, u32 cchLength) {
+  if (!lpsz) return 0;
+  for (u32 i = 0; i < cchLength; ++i)
+    if (lpsz[i] >= 'A' && lpsz[i] <= 'Z') lpsz[i] = (char)(lpsz[i] - 'A' + 'a');
+  return cchLength;
+}
 u16* TRT_STDCALL trt_CharNextW(const u16* lpsz) {
   if (!lpsz) return nullptr;
   return (u16*)(*lpsz ? lpsz + 1 : lpsz);
@@ -2115,6 +2121,81 @@ int TRT_STDCALL trt_UnhookWinEvent(void* hWinEventHook) {
 }
 void TRT_STDCALL trt_NotifyWinEvent(u32 event, void* hwnd, i32 idObject, i32 idChild) {
   (void)event; (void)hwnd; (void)idObject; (void)idChild;
+}
+
+// ---- Input / Dialog / Menu / Clipboard gaps (Cuphead & desktop parity) ----
+u32 TRT_STDCALL trt_SendInput(u32 cInputs, void* pInputs, int cbSize) {
+  if (!pInputs || cbSize <= 0) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  return cInputs;
+}
+
+u32 TRT_STDCALL trt_WaitForInputIdle(void* hProcess, u32 dwMilliseconds) {
+  (void)hProcess; (void)dwMilliseconds;
+  return 0;  // WAIT_SUCCESS: process ready
+}
+
+void* TRT_STDCALL trt_CopyImage(void* h, u32 type, int cx, int cy, u32 flags) {
+  (void)type; (void)cx; (void)cy; (void)flags;
+  return h;
+}
+
+int TRT_STDCALL trt_DragDetect(void* hwnd, u64 pt_packed) {
+  (void)hwnd; (void)pt_packed;
+  return 0;
+}
+
+void* TRT_STDCALL trt_CreateDialogParamW(void* hInst, const u16* tmpl,
+                                         void* parent, void* dlgProc,
+                                         i64 initParam) {
+  (void)tmpl;
+  return trt_CreateWindowExW(0, nullptr, (const wchar_t*)L"Dialog",
+                             0x00CF0000u /*WS_OVERLAPPEDWINDOW*/, 0, 0, 320, 200,
+                             parent, nullptr, hInst,
+                             (void*)(uintptr_t)initParam ? (void*)(uintptr_t)initParam : dlgProc);
+}
+
+void* TRT_STDCALL trt_CreateDialogParamA(void* hInst, const char* tmpl,
+                                         void* parent, void* dlgProc,
+                                         i64 initParam) {
+  (void)tmpl;
+  return trt_CreateDialogParamW(hInst, nullptr, parent, dlgProc, initParam);
+}
+
+int TRT_STDCALL trt_InsertMenuW(void* hMenu, u32 uPosition, u32 uFlags,
+                                u64 uIDNewItem, const u16* lpNewItem) {
+  (void)uPosition; (void)uFlags; (void)uIDNewItem; (void)lpNewItem;
+  return hMenu ? 1 : 0;
+}
+
+int TRT_STDCALL trt_GetMenuItemInfoW(void* hMenu, u32 item, int fByPosition,
+                                     void* lpmii) {
+  (void)hMenu; (void)item; (void)fByPosition; (void)lpmii;
+  trt_SetLastError(1456);  // ERROR_MENU_ITEM_NOT_FOUND
+  return 0;
+}
+
+int TRT_STDCALL trt_DeleteMenu(void* hMenu, u32 uPosition, u32 uFlags) {
+  (void)uPosition; (void)uFlags;
+  return hMenu ? 1 : 0;
+}
+
+int TRT_STDCALL trt_GetClipboardFormatNameA(u32 format, char* lpszFormatName,
+                                            int cchMaxCount) {
+  if (!lpszFormatName || cchMaxCount <= 0) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  const char* name = nullptr;
+  switch (format) {
+    case 1: name = "CF_TEXT"; break;
+    case 13: name = "CF_UNICODETEXT"; break;
+    default: name = "CustomClipboardFormat"; break;
+  }
+  const int n = snprintf(lpszFormatName, (size_t)cchMaxCount, "%s", name);
+  return n < cchMaxCount ? n : cchMaxCount - 1;
 }
 
 static const trt_named_fn k_u32_gap_fns[] = {
@@ -2410,6 +2491,7 @@ static const trt_named_fn k_u32_gap_fns[] = {
   {"CharLowerW", (void*)&trt_CharLowerW},
   {"CharLowerA", (void*)&trt_CharLowerA},
   {"CharLowerBuffW", (void*)&trt_CharLowerBuffW},
+  {"CharLowerBuffA", (void*)&trt_CharLowerBuffA},
   {"CharNextW", (void*)&trt_CharNextW},
   {"CharNextA", (void*)&trt_CharNextA},
   {"CharPrevW", (void*)&trt_CharPrevW},
@@ -2429,6 +2511,16 @@ static const trt_named_fn k_u32_gap_fns[] = {
   {"SetWinEventHook", (void*)&trt_SetWinEventHook},
   {"UnhookWinEvent", (void*)&trt_UnhookWinEvent},
   {"NotifyWinEvent", (void*)&trt_NotifyWinEvent},
+  {"SendInput", (void*)&trt_SendInput},
+  {"WaitForInputIdle", (void*)&trt_WaitForInputIdle},
+  {"CopyImage", (void*)&trt_CopyImage},
+  {"DragDetect", (void*)&trt_DragDetect},
+  {"CreateDialogParamW", (void*)&trt_CreateDialogParamW},
+  {"CreateDialogParamA", (void*)&trt_CreateDialogParamA},
+  {"InsertMenuW", (void*)&trt_InsertMenuW},
+  {"GetMenuItemInfoW", (void*)&trt_GetMenuItemInfoW},
+  {"DeleteMenu", (void*)&trt_DeleteMenu},
+  {"GetClipboardFormatNameA", (void*)&trt_GetClipboardFormatNameA},
 };
 
 void trt_u32_gap_register(void) {

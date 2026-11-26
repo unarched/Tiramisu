@@ -1095,6 +1095,31 @@ static u16 TRT_STDCALL nt_RtlCaptureStackBackTrace(u32 frames, u32 skip,
 #endif
 }
 
+static u32 TRT_GUEST_ABI nt_NtQueryDirectoryFile(
+    void* file_handle, void* event, void* apc_routine, void* apc_ctx,
+    void* io_status, void* file_info, u32 length, u32 info_class,
+    u8 return_single, const void* file_name, u8 restart_scan) {
+  (void)apc_routine; (void)apc_ctx; (void)info_class;
+  (void)return_single; (void)file_name; (void)restart_scan;
+  if (!file_handle || !io_status || !file_info || length == 0) {
+    return k_status_invalid_parameter;
+  }
+  *(u64*)((u8*)io_status + 0) = 0x80000006ULL;  // STATUS_NO_MORE_FILES
+  *(u64*)((u8*)io_status + 8) = 0ULL;
+  if (event) trt_SetEvent((u64)(uintptr_t)event);
+  return 0x80000006u;
+}
+
+static u32 TRT_GUEST_ABI nt_NtQueryDirectoryFileEx(
+    void* file_handle, void* event, void* apc_routine, void* apc_ctx,
+    void* io_status, void* file_info, u32 length, u32 info_class,
+    u32 query_flags, const void* file_name) {
+  (void)query_flags;
+  return nt_NtQueryDirectoryFile(file_handle, event, apc_routine, apc_ctx,
+                                  io_status, file_info, length, info_class,
+                                  0, file_name, 0);
+}
+
 } // namespace
 
 // .242 DIAG: NTALLOC accessors for VIDEO-SAMPLE (vk_backend.hpp).
@@ -1143,6 +1168,10 @@ int trt_bridge_register_ntdll(void) {
       {"NtProtectVirtualMemory", (void*)&nt_NtProtectVirtualMemory},
       {"NtClose", (void*)&nt_NtClose},
       {"NtQueryInformationFile", (void*)&nt_NtQueryInformationFile},
+      {"NtQueryDirectoryFile", (void*)&nt_NtQueryDirectoryFile},
+      {"ZwQueryDirectoryFile", (void*)&nt_NtQueryDirectoryFile},
+      {"NtQueryDirectoryFileEx", (void*)&nt_NtQueryDirectoryFileEx},
+      {"ZwQueryDirectoryFileEx", (void*)&nt_NtQueryDirectoryFileEx},
       {"NtWriteFile", (void*)&nt_NtWriteFile},
       {"NtCreateFile", (void*)&nt_NtCreateFile},
       {"NtReadFile", (void*)&nt_NtReadFile},

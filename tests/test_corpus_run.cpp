@@ -1012,6 +1012,9 @@ void* console_system_load(const char* module, const char* symbol) {
     if (wl_ieq(module, "ucrtbase.dll")) {
       if (void* f = ucrt_wrap_resolve(symbol)) return f;
     }
+    // Check registered TRT_ROUTE_SYSTEM fallbacks (e.g. wldap32, d3dcompiler,
+    // vcruntime140) before assigning an unimplemented blanket-0 thunk.
+    if (void* fb = trt_module_system_fallback(module, symbol)) return fb;
     // STAGE 7 discovery: name every blanket-0 bind of a whitelisted SYSTEM
     // symbol — each line is a candidate surface for the next fix-cycle.
     fprintf(stderr, "  [trt] SYSTEM bind (blanket-0): %s!%s\n", module, symbol);

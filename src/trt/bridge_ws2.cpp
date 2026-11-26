@@ -2126,6 +2126,11 @@ const trt_named_fn k_mswsock_fns[] = {
     {"WSASendMsg",           (void*)&ws2_WSASendMsg},
     {"WSARecvEx",            (void*)&ws2_WSARecvEx},
 };
+#if !defined(_WIN32)
+void* TRT_GUEST_ABI ws2_getservbyname(const char* name, const char* proto);
+void* TRT_GUEST_ABI ws2_getservbyport(i32 port, const char* proto);
+#endif
+
 const trt_named_fn k_wsock32_fns[] = {
     {"accept",         (void*)&ws2_accept},
     {"bind",           (void*)&ws2_bind},
@@ -2187,6 +2192,8 @@ const trt_named_fn k_wsock32_fns[] = {
     {"gethostbyaddr",  (void*)&ws2_gethostbyaddr},
     {"gethostbyname",  (void*)&ws2_gethostbyname},
     {"getprotobyname", (void*)&ws2_getprotobyname},
+    {"getservbyname",  (void*)&ws2_getservbyname},
+    {"getservbyport",  (void*)&ws2_getservbyport},
     {"gethostname",    (void*)&ws2_gethostname},
     {"WSAAsyncGetHostByName", (void*)&ws2_WSAAsyncGetHostByName},
     {"WSACancelAsyncRequest", (void*)&ws2_WSACancelAsyncRequest},
@@ -2194,6 +2201,8 @@ const trt_named_fn k_wsock32_fns[] = {
     {"#51",  (void*)&ws2_gethostbyaddr},
     {"#52",  (void*)&ws2_gethostbyname},
     {"#53",  (void*)&ws2_getprotobyname},
+    {"#55",  (void*)&ws2_getservbyname},
+    {"#56",  (void*)&ws2_getservbyport},
     {"#57",  (void*)&ws2_gethostname},
     {"#103", (void*)&ws2_WSAAsyncGetHostByName},
     {"#108", (void*)&ws2_WSACancelAsyncRequest},
@@ -2291,12 +2300,50 @@ i32 TRT_GUEST_ABI ws2_WSAStringToAddressA(const char* AddressString,
   return 0;
 }
 
+i32 TRT_GUEST_ABI ws2_WSARecvFrom(u64 s, const win64_wsabuf* bufs, u32 count,
+                                  u32* recvd, u32* flags, u8* from,
+                                  i32* fromlen, void* ov, void* comp) {
+  (void)ov; (void)comp;
+  int fd = sock_to_fd(s);
+  if (fd < 0) { set_wsa_err(k_wsa_enotsock); return k_socket_error; }
+  if (!bufs || count == 0 || count > 1024) {
+    set_wsa_err(k_wsa_einval);
+    return k_socket_error;
+  }
+  struct iovec iov[64];
+  const u32 n = count < 64 ? count : 64;
+  for (u32 i = 0; i < n; ++i) {
+    iov[i].iov_base = bufs[i].buf;
+    iov[i].iov_len = bufs[i].len;
+  }
+  struct sockaddr_storage ss;
+  memset(&ss, 0, sizeof(ss));
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_name = &ss;
+  msg.msg_namelen = sizeof(ss);
+  msg.msg_iov = iov;
+  msg.msg_iovlen = n;
+  int iflags = flags ? (int)*flags : 0;
+  ssize_t r = ::recvmsg(fd, &msg, iflags);
+  if (r < 0) { set_wsa_err(errno_to_wsa(errno)); return k_socket_error; }
+  if (from && fromlen && msg.msg_namelen > 0) {
+    sockaddr_posix_to_win((const struct sockaddr*)&ss, msg.msg_namelen, from,
+                          fromlen);
+  }
+  if (recvd) *recvd = (u32)r;
+  if (flags) *flags = (u32)msg.msg_flags;
+  set_wsa_err(0);
+  return 0;
+}
+
 const trt_named_fn k_ws2_extra_fns[] = {
     {"WSASocketA",               (void*)&ws2_WSASocketA},
     {"WSASocketW",               (void*)&ws2_WSASocketW},
     {"WSAConnect",               (void*)&ws2_WSAConnect},
     {"WSASend",                  (void*)&ws2_WSASend},
     {"WSARecv",                  (void*)&ws2_WSARecv},
+    {"WSARecvFrom",              (void*)&ws2_WSARecvFrom},
     {"WSASendDisconnect",        (void*)&ws2_WSASendDisconnect},
     {"WSAPoll",                  (void*)&ws2_WSAPoll},
     {"WSAIoctl",                 (void*)&ws2_WSAIoctl},

@@ -295,6 +295,23 @@ u32 TRT_GUEST_ABI trt_HidP_SetUsageValue(int type, u16 page, u16 link,
   return k_hidp_status_invalid_preparsed_data;
 }
 
+u32 TRT_GUEST_ABI trt_HidP_SetUsageValueArray(int type, u16 page, u16 link,
+                                              u16 usage, void* usage_value,
+                                              u16 byte_len, void* preparsed,
+                                              char* report, u32 rlen) {
+  (void)type; (void)page; (void)link; (void)usage; (void)usage_value;
+  (void)byte_len; (void)preparsed; (void)report; (void)rlen;
+  return k_hidp_status_invalid_preparsed_data;
+}
+
+u32 TRT_GUEST_ABI trt_HidP_InitializeReportForID(int type, u8 report_id,
+                                                 void* preparsed, char* report,
+                                                 u32 rlen) {
+  (void)type; (void)report_id; (void)preparsed;
+  if (report && rlen > 0) memset(report, 0, rlen);
+  return k_hidp_status_invalid_preparsed_data;
+}
+
 // ===========================================================================
 // setupapi.dll
 // ===========================================================================
@@ -545,6 +562,8 @@ int trt_bridge_register_hid(void) {
       {"HidP_MaxDataListLength", (void*)&trt_HidP_MaxDataListLength},
       {"HidP_SetUsages", (void*)&trt_HidP_SetUsages},
       {"HidP_SetUsageValue", (void*)&trt_HidP_SetUsageValue},
+      {"HidP_SetUsageValueArray", (void*)&trt_HidP_SetUsageValueArray},
+      {"HidP_InitializeReportForID", (void*)&trt_HidP_InitializeReportForID},
   };
   static const trt_named_fn k_setupapi_fns[] = {
       {"SetupDiCreateDeviceInfoList", (void*)&trt_SetupDiCreateDeviceInfoList},

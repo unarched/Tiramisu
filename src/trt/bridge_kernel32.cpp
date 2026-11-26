@@ -65,6 +65,8 @@ extern "C" int trt_cs_size_for_guest(void);
 #include "bridge_bink.h"
 #include "bridge_criware.h"
 #include "bridge_miles.h"
+#include "bridge_dstorage.h"
+#include "bridge_oodle.h"
 #include "bridge_wininet.h"
 #include "bridge_psapi.h"
 #include "bridge_iphlpapi.h"
@@ -1971,6 +1973,9 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_criware();
   // miles: Miles Sound System (stubs)
   trt_bridge_register_miles();
+  // dstorage / oodle: modern PC asset streaming & compression (honest fail-visible stubs)
+  trt_bridge_register_dstorage();
+  trt_bridge_register_oodle();
   // STAGE 5 boot determinism: the 7 UNCERTAIN console DLLs converted to
   // BUILTIN honest-runtime — the boot no longer depends on unproven
   // console presence (wininet/psapi/iphlpapi/imm32/crypt32/dbghelp/dbgcore)
@@ -4486,6 +4491,40 @@ int TRT_STDCALL trt_LCMapStringEx(const u16* locale, u32 flags, const u16* src,
                                   void*, void*) {
   (void)locale;
   return trt_LCMapStringW(0, flags, src, srclen, dst, dstlen);
+}
+
+int TRT_STDCALL trt_GetStringTypeA(u32 lcid, u32 type, const char* src,
+                                   int count, u16* types) {
+  (void)lcid;
+  if (!src || count == 0 || !types) return 0;
+  const int n = (count < 0) ? (int)strlen(src) + 1 : count;
+  if (n <= 0 || n > 4096) return 0;
+  u16 w[4096];
+  for (int i = 0; i < n; ++i) w[i] = (u16)(u8)src[i];
+  return trt_GetStringTypeW(type, w, n, types);
+}
+
+int TRT_STDCALL trt_LCMapStringA(u32 lcid, u32 flags, const char* src,
+                                 int srclen, char* dst, int dstlen) {
+  if (!src || (srclen < 0 && srclen != -1)) return 0;
+  const int n = (srclen == -1) ? (int)strlen(src) : srclen;
+  if (n > 4095) return 0;
+  u16 wsrc[4096]{};
+  for (int i = 0; i < n; ++i) wsrc[i] = (u16)(u8)src[i];
+  if (!dst || dstlen <= 0) {
+    return trt_LCMapStringW(lcid, flags, wsrc, srclen, nullptr, 0);
+  }
+  u16 wdst[4096]{};
+  const int wlen = (dstlen < 4096) ? dstlen : 4096;
+  const int got = trt_LCMapStringW(lcid, flags, wsrc, srclen, wdst, wlen);
+  for (int i = 0; i < got && i < dstlen; ++i) dst[i] = (char)(u8)wdst[i];
+  return got;
+}
+
+char* TRT_STDCALL trt_lstrcpyA(char* dst, const char* src) {
+  if (!dst || !src) return nullptr;
+  strcpy(dst, src);
+  return dst;
 }
 
 // ---- SEH / unwind family: Win64 .pdata + UNWIND_INFO walker for guest
@@ -8267,6 +8306,12 @@ void* TRT_STDCALL trt_FindFirstFileA(const char* name, void* info) {
   return h;
 }
 
+void* TRT_STDCALL trt_FindFirstFileExA(const char* name, u32 level, void* info,
+                                       u32 search_op, void* extra, u32 flags) {
+  (void)level; (void)search_op; (void)extra; (void)flags;
+  return trt_FindFirstFileA(name, info);
+}
+
 int TRT_STDCALL trt_FindNextFileA(void* handle, void* info) {
   if (!info) {
     err_ref_for_current_thread() = 87;  // ERROR_INVALID_PARAMETER
@@ -9468,6 +9513,26 @@ void TRT_STDCALL trt_RtlFillMemory(void* dst, u64 n, u8 fill) {
 }
 
 extern "C" int TRT_STDCALL trt_ResolveLocaleName(const u16* name, u16* out, int cch);
+extern "C" u32 TRT_STDCALL trt_VerLanguageNameW(u32 lang, u16* buf, u32 count);
+extern "C" u32 TRT_STDCALL trt_VerLanguageNameA(u32 lang, char* buf, u32 count);
+
+static int TRT_GUEST_ABI trt_CreateProcessA(
+    const char* app, char* cmdline, void* proc_attr, void* thread_attr,
+    int inherit, u32 flags, void* env, const char* dir, const void* startup,
+    void* info_out) {
+  auto widen = [](const char* s, std::vector<u16>& out) -> u16* {
+    if (!s) return nullptr;
+    const size_t n = strlen(s);
+    out.resize(n + 1);
+    for (size_t i = 0; i < n; ++i) out[i] = (u16)(unsigned char)s[i];
+    out[n] = 0;
+    return out.data();
+  };
+  std::vector<u16> wapp, wcmd, wdir;
+  return trt_CreateProcessW(widen(app, wapp), widen(cmdline, wcmd), proc_attr,
+                            thread_attr, inherit, flags, env, widen(dir, wdir),
+                            startup, info_out);
+}
 
 static const trt_named_fn k_kernel32_fns[] = {
   {"GetProcessHeap", (void*)&trt_GetProcessHeap},
@@ -9538,8 +9603,11 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"GetConsoleCP", (void*)&trt_GetConsoleCP},
   {"GetConsoleOutputCP", (void*)&trt_GetConsoleOutputCP},
   {"GetStringTypeW", (void*)&trt_GetStringTypeW},
+  {"GetStringTypeA", (void*)&trt_GetStringTypeA},
   {"LCMapStringW", (void*)&trt_LCMapStringW},
+  {"LCMapStringA", (void*)&trt_LCMapStringA},
   {"LCMapStringEx", (void*)&trt_LCMapStringEx},
+  {"lstrcpyA", (void*)&trt_lstrcpyA},
   {"CompareStringW", (void*)&trt_CompareStringW},
   {"CompareStringEx", (void*)&trt_CompareStringEx},
   {"RtlCaptureContext", (void*)&trt_RtlCaptureContext},
@@ -9597,6 +9665,7 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"WakeAllConditionVariable", (void*)&trt_WakeAllConditionVariable},
   {"WakeConditionVariable", (void*)&trt_WakeConditionVariable},
   {"FindFirstFileExW", (void*)&trt_FindFirstFileExW},
+  {"FindFirstFileExA", (void*)&trt_FindFirstFileExA},
   {"FindFirstFileW", (void*)&trt_FindFirstFileW},
   {"FindNextFileW", (void*)&trt_FindNextFileW},
   {"FindFirstFileA", (void*)&trt_FindFirstFileA},
@@ -9634,6 +9703,7 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"GetCurrentDirectoryA", (void*)&trt_GetCurrentDirectoryA},
   {"GetComputerNameA", (void*)&trt_GetComputerNameA},
   {"GetEnvironmentStringsA", (void*)&trt_GetEnvironmentStringsA},
+  {"GetEnvironmentStrings", (void*)&trt_GetEnvironmentStringsA},
   {"FreeEnvironmentStringsA", (void*)&trt_FreeEnvironmentStringsA},
   {"FormatMessageA", (void*)&trt_FormatMessageA},
   {"CompareStringOrdinal", (void*)&trt_CompareStringOrdinal},
@@ -9668,6 +9738,9 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"GetCurrentPackageId", (void*)&trt_GetCurrentPackageId},
   {"GetCurrentPackagePath", (void*)&trt_GetCurrentPackagePath},
   {"SetFileCompletionNotificationModes", (void*)&trt_SetFileCompletionNotificationModes},
+  {"CreateProcessA", (void*)&trt_CreateProcessA},
+  {"VerLanguageNameW", (void*)&trt_VerLanguageNameW},
+  {"VerLanguageNameA", (void*)&trt_VerLanguageNameA},
 };
 
 // Bun/V8 query the current thread stack before they scan it.  A synthesised
@@ -9719,6 +9792,16 @@ int trt_bridge_register_kernel32(void) {
   {
     extern void trt_gap_register(void);
     trt_gap_register();
+  }
+  // vcruntime140 fallback (SYSTEM-routed: OS vcruntime140_app preferred on Xbox)
+  {
+    extern int trt_bridge_register_vcruntime_fallback(void);
+    trt_bridge_register_vcruntime_fallback();
+  }
+  // kernel32 .rsrc resource lookup & enumeration (EnumResourceNamesW / FindResource*)
+  {
+    extern int trt_bridge_register_res(void);
+    trt_bridge_register_res();
   }
   return 0;
 }

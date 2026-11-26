@@ -2422,6 +2422,8 @@ u32 TRT_GUEST_ABI trt_D3DPERF_GetStatus(void* dev) { (void)dev; return 0; }
 int TRT_GUEST_ABI trt_D3DPERF_BeginEvent(u32 col, const u16* name) { (void)col; (void)name; return 0; }
 int TRT_GUEST_ABI trt_D3DPERF_EndEvent(void) { return 0; }
 void TRT_GUEST_ABI trt_D3DPERF_SetMarker(u32 col, const u16* name) { (void)col; (void)name; }
+void TRT_GUEST_ABI trt_D3DPERF_SetOptions(u32 opt) { (void)opt; }
+int TRT_GUEST_ABI trt_D3DPERF_QueryRepeatFrame(void) { return 0; }
 
 int trt_bridge_register_d3d9(void) {
   ensure_ex_vtbls();  // Ex objects are servable from the first call
@@ -2432,6 +2434,8 @@ int trt_bridge_register_d3d9(void) {
       {"D3DPERF_BeginEvent", (void*)&trt_D3DPERF_BeginEvent},
       {"D3DPERF_EndEvent", (void*)&trt_D3DPERF_EndEvent},
       {"D3DPERF_SetMarker", (void*)&trt_D3DPERF_SetMarker},
+      {"D3DPERF_SetOptions", (void*)&trt_D3DPERF_SetOptions},
+      {"D3DPERF_QueryRepeatFrame", (void*)&trt_D3DPERF_QueryRepeatFrame},
   };
   trt_module_register("d3d9.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

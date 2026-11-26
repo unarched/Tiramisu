@@ -1175,3 +1175,10 @@ clang++ -std=c++17 -O2 -Wall -no-pie -Isrc/trt tests/test_actctx.cpp \
 clang++ -std=c++17 -O2 -Wall -no-pie -Isrc/trt tests/test_version.cpp \
   -o "$out/test_version"
 "$out/test_version" corpus-local/botw-native/BotW-Native-Setup.exe
+
+# --- 59. Middleware bridges: Wwise, Bink, Miles, CriWare ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_middleware_bridges.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_middleware_bridges"
+"$out/test_middleware_bridges"
+

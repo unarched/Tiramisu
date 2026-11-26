@@ -1059,6 +1059,16 @@ i32 TRT_GUEST_ABI mf_MFGetStrideForBitmapInfoHeader(u32 fmt, u32 w, i32* stride)
 i32 TRT_GUEST_ABI mf_DXVA2CreateDirect3DDeviceManager9(u32* reset_tok, void** out) {
   return mf_MFCreateDXGIDeviceManager(reset_tok, out);
 }
+i32 TRT_GUEST_ABI mf_MFCreateFile(u32 access_mode, u32 open_mode, u32 flags,
+                                  const u16* url, void** out_stream) {
+  (void)access_mode; (void)open_mode; (void)flags; (void)url;
+  if (out_stream) *out_stream = nullptr;
+  return E_NOTIMPL_;
+}
+i32 TRT_GUEST_ABI mf_MFCreateSourceResolver(void** out_resolver) {
+  if (out_resolver) *out_resolver = nullptr;
+  return E_NOTIMPL_;
+}
 
 }  // namespace
 
@@ -1085,6 +1095,8 @@ extern "C" int trt_bridge_register_mf(void) {
       {"MFCreateDXGIDeviceManager", (void*)&mf_MFCreateDXGIDeviceManager},
       {"MFGetStrideForBitmapInfoHeader",
        (void*)&mf_MFGetStrideForBitmapInfoHeader},
+      {"MFCreateFile", (void*)&mf_MFCreateFile},
+      {"MFCreateSourceResolver", (void*)&mf_MFCreateSourceResolver},
   };
   trt_module_register("mfplat.dll", TRT_ROUTE_BUILTIN, k_mfplat,
                       (int)(sizeof(k_mfplat) / sizeof(k_mfplat[0])));

@@ -12,6 +12,7 @@
 #include "trt.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace {
@@ -40,8 +41,14 @@ unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_GetDefaultPlatformInitSettings(void*
 // ---- Memory Manager ----
 int TRT_GUEST_ABI wwise_AK_MemoryMgr_Init(void* s) { return AK_SUCCESS; }
 int TRT_GUEST_ABI wwise_AK_MemoryMgr_Term(void) { return AK_SUCCESS; }
-void* TRT_GUEST_ABI wwise_AK_MemoryMgr_Malloc(unsigned size) { return nullptr; }
-void TRT_GUEST_ABI wwise_AK_MemoryMgr_Free(void* p) {}
+void* TRT_GUEST_ABI wwise_AK_MemoryMgr_Malloc(unsigned size) {
+    void* p = malloc(size ? size : 16);
+    if (p) memset(p, 0, size ? size : 16);
+    return p;
+}
+void TRT_GUEST_ABI wwise_AK_MemoryMgr_Free(void* p) {
+    if (p) free(p);
+}
 
 // ---- Stream Manager ----
 int TRT_GUEST_ABI wwise_AK_StreamMgr_Create(void* s) { return AK_SUCCESS; }
@@ -74,13 +81,16 @@ unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_UnloadBankID(unsigned bank_id) { ret
 
 // ---- Event Playback ----
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_PostEvent(const char* event_name, unsigned game_obj, unsigned flags, void* cb, void* cookie) {
+    static unsigned s_playing_id = 1000;
     char buf[256];
-    snprintf(buf, sizeof(buf), "wwise: PostEvent('%s') -> stub (silent)", event_name ? event_name : "(null)");
+    unsigned id = ++s_playing_id;
+    snprintf(buf, sizeof(buf), "wwise: PostEvent('%s') -> stub (playing_id=%u)", event_name ? event_name : "(null)", id);
     log_line(buf);
-    return 0; // playing ID 0 = invalid
+    return id;
 }
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_PostEventID(unsigned event_id, unsigned game_obj, unsigned flags, void* cb, void* cookie) {
-    return 0;
+    static unsigned s_playing_id = 2000;
+    return ++s_playing_id;
 }
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_ExecuteActionOnEvent(const char* event_name, unsigned action, unsigned game_obj, int transition, unsigned playing_id) { return AK_SUCCESS; }
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_StopAll(unsigned game_obj) { return AK_SUCCESS; }
@@ -97,7 +107,16 @@ unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_SetSwitch(const char* switch_group, 
 
 // ---- Query ----
 unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_IsInitialized(void) { return 1; }
-unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_GetIDFromString(const char* str) { return 0; }
+unsigned TRT_GUEST_ABI wwise_AK_SoundEngine_GetIDFromString(const char* str) {
+    if (!str || !*str) return 0;
+    unsigned int hash = 2166136261u;
+    for (const char* p = str; *p; ++p) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+        hash = (hash ^ (unsigned char)c) * 16777619u;
+    }
+    return hash;
+}
 
 // ---- AkSoundEngine namespace variants (AK:: namespace) ----
 // These are the C++ mangled names; we register unmangled for GetProcAddress

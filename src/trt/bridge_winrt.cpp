@@ -2305,6 +2305,13 @@ int trt_bridge_register_winrt(void) {
       {"WinHttpQueryOption", (void*)&whttp_WinHttpQueryOption},
       {"WinHttpSetTimeouts", (void*)&whttp_WinHttpSetTimeouts},
       {"WinHttpCrackUrl", (void*)&whttp_WinHttpCrackUrl},
+      {"WinHttpSetStatusCallback",
+       (void*)+[](void* hInternet, void* cb, u32 notify_flags,
+                  u64 reserved) TRT_GUEST_ABI -> void* {
+         (void)cb; (void)notify_flags; (void)reserved;
+         if (!hInternet) return (void*)(uintptr_t)-1;  // WINHTTP_INVALID_STATUS_CALLBACK
+         return nullptr;
+       }},
   };
   trt_module_register("winhttp.dll", TRT_ROUTE_BUILTIN, k_winhttp,
                       (int)(sizeof(k_winhttp) / sizeof(k_winhttp[0])));

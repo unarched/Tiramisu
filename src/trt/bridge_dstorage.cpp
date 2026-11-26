@@ -33,11 +33,30 @@ long TRT_GUEST_ABI dstorage_DStorageGetFactory(const void* riid, void** ppv) {
     return (long)E_NOTIMPL_;
 }
 
+long TRT_GUEST_ABI dstorage_DStorageSetConfiguration(const void* config) {
+    (void)config;
+    return 0; // S_OK: accept configuration
+}
+
+long TRT_GUEST_ABI dstorage_DStorageSetConfiguration1(const void* config) {
+    (void)config;
+    return 0; // S_OK: accept configuration
+}
+
+long TRT_GUEST_ABI dstorage_DStorageCreateCompressionCodec(u32 format, u32 threads, const void* riid, void** ppv) {
+    (void)format; (void)threads; (void)riid;
+    if (ppv) *ppv = nullptr;
+    return (long)E_NOTIMPL_;
+}
+
 }  // extern "C"
 
 extern "C" int trt_bridge_register_dstorage(void) {
     static const trt_named_fn k_fns[] = {
         {"DStorageGetFactory", (void*)&dstorage_DStorageGetFactory},
+        {"DStorageSetConfiguration", (void*)&dstorage_DStorageSetConfiguration},
+        {"DStorageSetConfiguration1", (void*)&dstorage_DStorageSetConfiguration1},
+        {"DStorageCreateCompressionCodec", (void*)&dstorage_DStorageCreateCompressionCodec},
     };
     trt_module_register("dstorage.dll", TRT_ROUTE_BUILTIN, k_fns,
                         (int)(sizeof(k_fns) / sizeof(k_fns[0])));

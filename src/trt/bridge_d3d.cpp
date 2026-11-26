@@ -1675,7 +1675,19 @@ int trt_bridge_register_d3d(void) {
   static const trt_named_fn k_dwm_fns[] = {
       {"DwmGetWindowAttribute",
        (void*)+[](u64 hwnd, u32 attr, void* out, u32 cap) TRT_GUEST_ABI -> i32 {
-         (void)hwnd; (void)out; (void)cap;
+         if (attr == 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */ && out && cap >= 16) {
+           i32 w = 0, h = 0;
+           trt_user32_client_size(reinterpret_cast<void*>(hwnd), &w, &h);
+           if (w <= 0 || h <= 0) { w = 1920; h = 1080; }
+           i32* r = reinterpret_cast<i32*>(out);
+           r[0] = 0; r[1] = 0; r[2] = w; r[3] = h;
+           return 0;
+         }
+         if ((attr == 1 /* DWMWA_NCRENDERING_ENABLED */ ||
+              attr == 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */) && out && cap >= 4) {
+           *reinterpret_cast<u32*>(out) = 1;
+           return 0;
+         }
          char line[128];
          snprintf(line, sizeof(line),
                   "dwm: DwmGetWindowAttribute(attr=%u) -> E_INVALIDARG "
@@ -1686,12 +1698,22 @@ int trt_bridge_register_d3d(void) {
       {"DwmSetWindowAttribute",
        (void*)+[](u64 hwnd, u32 attr, const void* val, u32 cap) TRT_GUEST_ABI -> i32 {
          (void)hwnd; (void)val; (void)cap;
+         if (attr == 2 || attr == 3 || attr == 4 || attr == 13 || attr == 20 ||
+             (attr >= 33 && attr <= 36)) {
+           return 0;  // S_OK: harmless window styling / theme attributes accepted
+         }
          char line[128];
          snprintf(line, sizeof(line),
                   "dwm: DwmSetWindowAttribute(attr=%u) -> E_INVALIDARG "
                   "(no DWM attribute surface: fail-visible)", attr);
          trt_core_log(line);
          return (int)0x80070057;
+       }},
+      {"DwmGetColorizationColor",
+       (void*)+[](u32* color, int* opaque) TRT_GUEST_ABI -> i32 {
+         if (color) *color = 0xff0078d7u;  // Windows desktop theme accent color
+         if (opaque) *opaque = 1;
+         return 0;
        }},
       {"DwmEnableBlurBehindWindow",
        (void*)+[](u64 hwnd, const void* bb) TRT_GUEST_ABI -> i32 {

@@ -61,6 +61,8 @@ struct guest_window {
   i32 x, y;             // guest window origin
   i32 cx, cy;           // current client surface size
   i32 upd_l, upd_t, upd_r, upd_b;  // owed repaint (empty when l >= r)
+  u64 parent;
+  wchar_t class_name[64];
   wchar_t title[64];
 };
 std::mutex g_win_mu;
@@ -183,12 +185,20 @@ u16 TRT_STDCALL trt_RegisterClassExW(const void* wcx) {
   for (guest_window& gw : g_wins) {
     if (gw.handle == 0 && gw.class_atom == atom) {
       gw.proc = (i64)(uintptr_t)c->proc;
+      size_t i = 0;
+      for (; c->name[i] && i < 63; ++i) gw.class_name[i] = c->name[i];
+      gw.class_name[i] = 0;
       return atom;
     }
   }
   guest_window w = {};
   w.class_atom = atom;
   w.proc = (i64)(uintptr_t)c->proc;
+  {
+    size_t i = 0;
+    for (; c->name[i] && i < 63; ++i) w.class_name[i] = c->name[i];
+    w.class_name[i] = 0;
+  }
   g_wins.push_back(w);
   return atom;
 }
@@ -258,12 +268,18 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     rec.handle = hwnd;
     rec.class_atom = found_atom;
     rec.proc = found_proc;
+    rec.parent = (u64)(uintptr_t)parent;
     rec.x = x == (-2147483647 - 1) ? 0 : x;  // CW_USEDEFAULT
     rec.y = y == (-2147483647 - 1) ? 0 : y;
     rec.cx = w > 0 ? w : 1920;
     rec.cy = h > 0 ? h : 1080;
     rec.upd_l = rec.upd_t = 0;
     rec.upd_r = rec.upd_b = 0;
+    if (cls && ((uintptr_t)cls >> 16) != 0) {
+      size_t i = 0;
+      for (; cls[i] && i < 63; ++i) rec.class_name[i] = cls[i];
+      rec.class_name[i] = 0;
+    }
     if (title) {
       size_t i = 0;
       for (; title[i] && i < 63; ++i) rec.title[i] = title[i];
@@ -1668,7 +1684,105 @@ int TRT_STDCALL trt_LookupIconIdFromDirectoryEx(const u8* bits, int icon,
   return 1;
 }
 
+static bool w16_ascii_lower_eq(const wchar_t* stored, const u16* query) {
+  if (!query) return true;
+  if (!stored) return false;
+  size_t i = 0;
+  for (;;) {
+    const u16 a = (u16)(stored[i] & 0xFFFFu);
+    const u16 b = query[i];
+    const u16 la = (a >= 'A' && a <= 'Z') ? (u16)(a - 'A' + 'a') : a;
+    const u16 lb = (b >= 'A' && b <= 'Z') ? (u16)(b - 'A' + 'a') : b;
+    if (la != lb) return false;
+    if (la == 0) return true;
+    ++i;
+  }
+}
+
+static bool w16_exact_eq(const wchar_t* stored, const u16* query) {
+  if (!query) return true;
+  if (!stored) return false;
+  size_t i = 0;
+  for (;;) {
+    const u16 a = (u16)(stored[i] & 0xFFFFu);
+    const u16 b = query[i];
+    if (a != b) return false;
+    if (a == 0) return true;
+    ++i;
+  }
+}
+
+void* TRT_STDCALL trt_FindWindowExW(void* parent, void* child_after,
+                                    const u16* cls, const u16* title) {
+  std::lock_guard<std::mutex> lk(g_win_mu);
+  const u64 parent_h = (u64)(uintptr_t)parent;
+  const u64 after_h = (u64)(uintptr_t)child_after;
+  bool passed_after = (after_h == 0);
+  const bool cls_is_atom = cls && (((uintptr_t)cls >> 16) == 0);
+  const u64 want_atom = cls_is_atom ? (u64)(uintptr_t)cls : 0ULL;
+  for (const guest_window& gw : g_wins) {
+    if (gw.handle == 0) continue;
+    if (!passed_after) {
+      if (gw.handle == after_h) passed_after = true;
+      continue;
+    }
+    if (parent_h && gw.parent != parent_h) continue;
+    if (cls) {
+      if (cls_is_atom) {
+        if (gw.class_atom != want_atom) continue;
+      } else {
+        if (!w16_ascii_lower_eq(gw.class_name, cls)) continue;
+      }
+    }
+    if (title && !w16_exact_eq(gw.title, title)) continue;
+    return (void*)(uintptr_t)gw.handle;
+  }
+  return nullptr;
+}
+
+void* TRT_STDCALL trt_FindWindowW(const u16* cls, const u16* title) {
+  return trt_FindWindowExW(nullptr, nullptr, cls, title);
+}
+
+static void a2w_find_buf(const char* src, u16* dst, size_t cap) {
+  size_t i = 0;
+  if (src) {
+    for (; src[i] && i + 1 < cap; ++i) dst[i] = (u16)(unsigned char)src[i];
+  }
+  dst[i] = 0;
+}
+
+void* TRT_STDCALL trt_FindWindowExA(void* parent, void* child_after,
+                                    const char* cls, const char* title) {
+  u16 wcls_buf[128], wtitle_buf[128];
+  const u16* wcls = nullptr;
+  const u16* wtitle = nullptr;
+  if (cls) {
+    if (((uintptr_t)cls >> 16) == 0) wcls = (const u16*)cls;
+    else { a2w_find_buf(cls, wcls_buf, 128); wcls = wcls_buf; }
+  }
+  if (title) {
+    a2w_find_buf(title, wtitle_buf, 128);
+    wtitle = wtitle_buf;
+  }
+  return trt_FindWindowExW(parent, child_after, wcls, wtitle);
+}
+
+void* TRT_STDCALL trt_FindWindowA(const char* cls, const char* title) {
+  return trt_FindWindowExA(nullptr, nullptr, cls, title);
+}
+
+void* TRT_STDCALL trt_CreateIconFromResource(const u8* bits, u32 len, int icon,
+                                             u32 ver) {
+  return trt_CreateIconFromResourceEx(bits, len, icon, ver, 0, 0, 0);
+}
+
 static const trt_named_fn k_user32_fns[] = {
+  {"CreateIconFromResource", (void*)&trt_CreateIconFromResource},
+  {"FindWindowW", (void*)&trt_FindWindowW},
+  {"FindWindowA", (void*)&trt_FindWindowA},
+  {"FindWindowExW", (void*)&trt_FindWindowExW},
+  {"FindWindowExA", (void*)&trt_FindWindowExA},
   {"PostQuitMessage", (void*)&trt_PostQuitMessage},
   {"SetFocus", (void*)&trt_SetFocus},
   {"GetFocus", (void*)&trt_GetFocus},

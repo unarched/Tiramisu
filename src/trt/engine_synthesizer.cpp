@@ -1094,6 +1094,9 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
                             out_profile->engine_type == TRT_ENGINE_UNITY_MONO ||
                             out_profile->engine_type == TRT_ENGINE_UNREAL ||
                             out_profile->engine_type == TRT_ENGINE_FNA_XNA;
+  const bool is_unity_engine =
+      out_profile->engine_type == TRT_ENGINE_UNITY_IL2CPP ||
+      out_profile->engine_type == TRT_ENGINE_UNITY_MONO;
 
   if (out_profile->engine_type == TRT_ENGINE_UNIVERSAL) {
     // Universal guest: prefer a GPU-backed API when the game's imports hint
@@ -1107,6 +1110,10 @@ static bool synthesize_engine(const char* game_dir, const char* target_exe_hint,
   } else if (out_profile->engine_type == TRT_ENGINE_GODOT && imp_vk) {
     out_profile->preferred_gfx = TRT_GFX_VULKAN;
   } else if (prefer_d3d11 && imp_d11) {
+    out_profile->preferred_gfx = TRT_GFX_D3D11;
+  } else if (is_unity_engine && !imp_d12 && !imp_vk) {
+    // Unity Mono/IL2CPP builds on Windows load d3d11.dll dynamically even when
+    // the bootstrapper statically imports opengl32.dll (e.g. Cuphead.exe).
     out_profile->preferred_gfx = TRT_GFX_D3D11;
   } else if (imp_d12) {
     out_profile->preferred_gfx = TRT_GFX_D3D12;

@@ -3003,3 +3003,55 @@ extern "C" int trt_bridge_register_msvcrt(void) {
                       (int)(sizeof(k_msvcrt_fns) / sizeof(k_msvcrt_fns[0])));
   return 0;
 }
+
+static int TRT_GUEST_ABI crt__purecall(void) {
+  trt_core_log("vcruntime140: _purecall invoked");
+  return 0;
+}
+
+static int TRT_GUEST_ABI crt___std_type_info_compare(const void* lhs,
+                                                     const void* rhs) {
+  if (lhs == rhs) return 0;
+  if (!lhs) return -1;
+  if (!rhs) return 1;
+  const char* a = (const char*)lhs + 8;
+  const char* b = (const char*)rhs + 8;
+  return strcmp(a, b);
+}
+
+static void TRT_GUEST_ABI crt___std_type_info_destroy_list(void* root) {
+  (void)root;
+}
+
+static void TRT_GUEST_ABI crt__CxxThrowException(void* obj, const void* info) {
+  (void)obj; (void)info;
+  trt_core_log("vcruntime140: _CxxThrowException fallback reached without host EH");
+}
+
+extern "C" int trt_bridge_register_vcruntime_fallback(void) {
+  static const trt_named_fn k_vcr_fns[] = {
+      {"memcpy", (void*)&crt_memcpy},
+      {"memmove", (void*)&crt_memmove},
+      {"memset", (void*)&crt_memset},
+      {"memcmp", (void*)&crt_memcmp},
+      {"memchr", (void*)&crt_memchr},
+      {"strchr", (void*)&crt_strchr},
+      {"strrchr", (void*)&crt_strrchr},
+      {"strstr", (void*)&crt_strstr},
+      {"wcschr", (void*)&crt_wcschr},
+      {"wcsrchr", (void*)&crt_wcsrchr},
+      {"wcsstr", (void*)&crt_wcsstr},
+      {"_setjmp", (void*)&crt__setjmp},
+      {"longjmp", (void*)&crt_longjmp},
+      {"_purecall", (void*)&crt__purecall},
+      {"__std_type_info_compare", (void*)&crt___std_type_info_compare},
+      {"__std_type_info_destroy_list", (void*)&crt___std_type_info_destroy_list},
+      {"_CxxThrowException", (void*)&crt__CxxThrowException},
+  };
+  const int n = (int)(sizeof(k_vcr_fns) / sizeof(k_vcr_fns[0]));
+  trt_module_register("vcruntime140.dll", TRT_ROUTE_SYSTEM, k_vcr_fns, n);
+  trt_module_register("vcruntime140_app.dll", TRT_ROUTE_SYSTEM, k_vcr_fns, n);
+  trt_module_register("vcruntime140_1.dll", TRT_ROUTE_SYSTEM, k_vcr_fns, n);
+  trt_module_register("vcruntime140_1_app.dll", TRT_ROUTE_SYSTEM, k_vcr_fns, n);
+  return 0;
+}

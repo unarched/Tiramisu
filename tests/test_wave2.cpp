@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <ucontext.h>
 #include <unistd.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -1316,6 +1317,179 @@ void test_wave2e_sys_net_d3d9() {
   trt_d3d9_set_hooks(&empty_d9);
 }
 
+static std::atomic<int> g_tq_hits{0};
+static void* g_tq_last_param = nullptr;
+static void TRT_GUEST_ABI test_tq_cb(void* param, u8 timer_or_wait_fired) {
+  if (timer_or_wait_fired) {
+    g_tq_last_param = param;
+    g_tq_hits.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void test_wave2g_proton_compat() {
+  printf("-- Wave 2G: TimerQueue / FindWindow / DXBC / Token / NtQueryDir / Fallback --\n");
+
+  // 1. Timer Queue (CreateTimerQueue / CreateTimerQueueTimer / Change / Delete)
+  auto create_tq = (void* (TRT_STDCALL*)(void))trt_resolve_module(nullptr, "kernel32.dll", "CreateTimerQueue", 0);
+  auto create_tqt = (int (TRT_STDCALL*)(void**, void*, void*, void*, u32, u32, u32))
+      trt_resolve_module(nullptr, "kernel32.dll", "CreateTimerQueueTimer", 0);
+  auto change_tqt = (int (TRT_STDCALL*)(void*, void*, u32, u32))
+      trt_resolve_module(nullptr, "kernel32.dll", "ChangeTimerQueueTimer", 0);
+  auto del_tqt = (int (TRT_STDCALL*)(void*, void*, u64))
+      trt_resolve_module(nullptr, "kernel32.dll", "DeleteTimerQueueTimer", 0);
+  auto del_tqe = (int (TRT_STDCALL*)(void*, u64))
+      trt_resolve_module(nullptr, "kernel32.dll", "DeleteTimerQueueEx", 0);
+  CHECK(create_tq && create_tqt && change_tqt && del_tqt && del_tqe,
+        "TimerQueue APIs resolve from kernel32");
+  if (create_tq && create_tqt && del_tqt && del_tqe) {
+    g_tq_hits.store(0);
+    void* q = create_tq();
+    void* t = nullptr;
+    int sentinel = 42;
+    const int ok_create = create_tqt(&t, q, (void*)&test_tq_cb, &sentinel, 5, 10, 0);
+    for (int i = 0; i < 40 && g_tq_hits.load() == 0; ++i) usleep(5000);
+    CHECK(ok_create == 1 && t != nullptr && g_tq_hits.load() >= 1 && g_tq_last_param == &sentinel,
+          "CreateTimerQueueTimer fires callback with expected parameter");
+    CHECK(change_tqt(q, t, 50, 0) == 1, "ChangeTimerQueueTimer succeeds");
+    CHECK(del_tqt(q, t, (u64)(intptr_t)-1) == 1, "DeleteTimerQueueTimer sync wait succeeds");
+    CHECK(del_tqe(q, (u64)(intptr_t)-1) == 1, "DeleteTimerQueueEx sync succeeds");
+  }
+
+  // 2. FindWindowA / FindWindowExW
+  auto reg_cls_a = (u16 (TRT_STDCALL*)(const void*))trt_resolve_module(nullptr, "user32.dll", "RegisterClassExA", 0);
+  auto cw_a = (void* (TRT_STDCALL*)(u32, const char*, const char*, u32, int, int, int, int, void*, void*, void*, void*))
+      trt_resolve_module(nullptr, "user32.dll", "CreateWindowExA", 0);
+  auto fw_a = (void* (TRT_STDCALL*)(const char*, const char*))trt_resolve_module(nullptr, "user32.dll", "FindWindowA", 0);
+  auto fwe_a = (void* (TRT_STDCALL*)(void*, void*, const char*, const char*))
+      trt_resolve_module(nullptr, "user32.dll", "FindWindowExA", 0);
+  CHECK(fw_a && fwe_a, "FindWindowA / FindWindowExA resolve");
+  if (reg_cls_a && cw_a && fw_a && fwe_a) {
+    struct wcx_a {
+      u32 cbSize; u32 style; void* proc; i32 cx; i32 wx; void* inst;
+      void* icon; void* cur; void* br; const char* menu; const char* cls; void* sm;
+    } wc{};
+    wc.cbSize = sizeof(wc);
+    wc.cls = "TiramisuTestWndCls";
+    reg_cls_a(&wc);
+    void* hw = cw_a(0, "TiramisuTestWndCls", "TiramisuTitle", 0, 0, 0, 640, 360,
+                    nullptr, nullptr, nullptr, nullptr);
+    CHECK(hw != nullptr && fw_a("TiramisuTestWndCls", "TiramisuTitle") == hw,
+          "FindWindowA locates created window by class and title");
+    CHECK(fwe_a(nullptr, hw, "TiramisuTestWndCls", "TiramisuTitle") == nullptr,
+          "FindWindowExA respects hwndChildAfter");
+  }
+
+  // 3. DXBC D3DCreateBlob / D3DGetBlobPart / D3DStripShader system fallback
+  auto d3d_create_blob = (int (TRT_GUEST_ABI*)(size_t, void**))
+      trt_module_system_fallback("d3dcompiler_43.dll", "D3DCreateBlob");
+  auto d3d_get_part = (int (TRT_GUEST_ABI*)(const void*, size_t, u32, u32, void**))
+      trt_module_system_fallback("d3dcompiler_43.dll", "D3DGetBlobPart");
+  auto d3d_strip = (int (TRT_GUEST_ABI*)(const void*, size_t, u32, void**))
+      trt_module_system_fallback("d3dcompiler_43.dll", "D3DStripShader");
+  CHECK(d3d_create_blob && d3d_get_part && d3d_strip,
+        "d3dcompiler_43 fallbacks resolve via d3dcompiler_47 alias");
+  if (d3d_create_blob && d3d_get_part && d3d_strip) {
+    void* blob = nullptr;
+    CHECK(d3d_create_blob(16, &blob) == 0 && blob != nullptr &&
+              slot<u64(TRT_GUEST_ABI*)(void*)>(blob, 4)(blob) == 16,
+          "D3DCreateBlob creates ID3DBlob of requested size");
+    if (blob) slot<u32(TRT_GUEST_ABI*)(void*)>(blob, 2)(blob);
+
+    // Minimal valid 2-chunk DXBC: SHDR ("abcd") + SPDB ("dbgi")
+    u8 dxbc[64]{};
+    dxbc[0] = 'D'; dxbc[1] = 'X'; dxbc[2] = 'B'; dxbc[3] = 'C';
+    *(u32*)(dxbc + 20) = 1u;
+    *(u32*)(dxbc + 24) = 64u;
+    *(u32*)(dxbc + 28) = 2u;
+    *(u32*)(dxbc + 32) = 40u;
+    *(u32*)(dxbc + 36) = 52u;
+    memcpy(dxbc + 40, "SHDR", 4); *(u32*)(dxbc + 44) = 4u; memcpy(dxbc + 48, "CODE", 4);
+    memcpy(dxbc + 52, "SPDB", 4); *(u32*)(dxbc + 56) = 4u; memcpy(dxbc + 60, "DBGI", 4);
+
+    void* shdr = nullptr;
+    const int gpr = d3d_get_part(dxbc, sizeof(dxbc), 6 /*LEGACY_SHADER*/, 0, &shdr);
+    CHECK(gpr == 0 && shdr != nullptr &&
+              slot<u64(TRT_GUEST_ABI*)(void*)>(shdr, 4)(shdr) == 4 &&
+              memcmp(slot<void*(TRT_GUEST_ABI*)(void*)>(shdr, 3)(shdr), "CODE", 4) == 0,
+          "D3DGetBlobPart extracts SHDR payload into ID3DBlob");
+    if (shdr) slot<u32(TRT_GUEST_ABI*)(void*)>(shdr, 2)(shdr);
+
+    void* stripped = nullptr;
+    const int sr = d3d_strip(dxbc, sizeof(dxbc), 2 /*DEBUG_INFO*/, &stripped);
+    CHECK(sr == 0 && stripped != nullptr, "D3DStripShader strips SPDB debug chunk");
+    if (stripped) {
+      const void* sp = slot<void*(TRT_GUEST_ABI*)(void*)>(stripped, 3)(stripped);
+      const u64 sz = slot<u64(TRT_GUEST_ABI*)(void*)>(stripped, 4)(stripped);
+      void* spdb_after = nullptr;
+      CHECK(*(const u32*)((const u8*)sp + 28) == 1u &&
+                d3d_get_part(sp, (size_t)sz, 5 /*DEBUG_INFO*/, 0, &spdb_after) != 0,
+            "Stripped DXBC retains 1 chunk and omits SPDB");
+      slot<u32(TRT_GUEST_ABI*)(void*)>(stripped, 2)(stripped);
+    }
+  }
+
+  // 4. Token impersonation + NtQueryDirectoryFile + QueryFullProcessImageName + vcruntime/ws2 ordinals
+  auto open_proc_tok = (void* (TRT_GUEST_ABI*)(void*, u32, void**))
+      trt_resolve_module(nullptr, "advapi32.dll", "OpenProcessToken", 0);
+  auto open_thr_tok = (int (TRT_GUEST_ABI*)(void*, u32, int, void**))
+      trt_resolve_module(nullptr, "advapi32.dll", "OpenThreadToken", 0);
+  auto dup_tok = (int (TRT_GUEST_ABI*)(void*, int, void**))
+      trt_resolve_module(nullptr, "advapi32.dll", "DuplicateToken", 0);
+  auto imp_user = (int (TRT_GUEST_ABI*)(void*))
+      trt_resolve_module(nullptr, "advapi32.dll", "ImpersonateLoggedOnUser", 0);
+  auto revert_self = (int (TRT_GUEST_ABI*)(void))
+      trt_resolve_module(nullptr, "advapi32.dll", "RevertToSelf", 0);
+  if (open_proc_tok && open_thr_tok && dup_tok && imp_user && revert_self) {
+    void* tok = nullptr;
+    void* ttok = nullptr;
+    void* dtok = nullptr;
+    CHECK(open_thr_tok(nullptr, 8, 1, &ttok) == 0,
+          "OpenThreadToken returns FALSE when not impersonating");
+    CHECK(open_proc_tok((void*)(intptr_t)-1, 8, &tok) != nullptr &&
+              dup_tok(tok, 2, &dtok) == 1 && imp_user(dtok) == 1 &&
+              open_thr_tok(nullptr, 8, 1, &ttok) == 1 && revert_self() == 1,
+          "Token duplicate/impersonate/open-thread/revert lifecycle works");
+  }
+
+  auto nt_qdir = (u32 (TRT_GUEST_ABI*)(void*, void*, void*, void*, void*, void*, u32, u32, u8, const void*, u8))
+      trt_resolve_module(nullptr, "ntdll.dll", "NtQueryDirectoryFile", 0);
+  if (nt_qdir) {
+    struct { u64 status; u64 info; } iosb{99, 99};
+    u8 buf[32]{};
+    CHECK(nt_qdir((void*)1, nullptr, nullptr, nullptr, &iosb, buf, sizeof(buf), 3, 0, nullptr, 0) == 0x80000006u &&
+              iosb.status == 0x80000006ULL && iosb.info == 0ULL,
+          "NtQueryDirectoryFile sets STATUS_NO_MORE_FILES cleanly");
+  }
+
+  auto qfp_a = (int (TRT_STDCALL*)(void*, u32, char*, u32*))
+      trt_resolve_module(nullptr, "kernel32.dll", "QueryFullProcessImageNameA", 0);
+  if (qfp_a) {
+    char pbuf[260]{};
+    u32 sz = sizeof(pbuf);
+    CHECK(qfp_a((void*)(intptr_t)-1, 0, pbuf, &sz) == 1 && sz > 0,
+          "QueryFullProcessImageNameA returns current image path");
+  }
+
+  CHECK(trt_module_system_fallback("vcruntime140.dll", "memcpy") != nullptr &&
+            trt_module_system_fallback("wldap32.dll", "#27") != nullptr &&
+            trt_ws2_resolve("#55") != nullptr &&
+            trt_ws2_resolve("#56") != nullptr &&
+            trt_resolve_module(nullptr, "kernel32.dll", "EnumResourceNamesW", 0) != nullptr &&
+            trt_resolve_module(nullptr, "user32.dll", "CreateIconFromResource", 0) != nullptr &&
+            trt_resolve_module(nullptr, "dnsapi.dll", "DnsFree", 0) != nullptr,
+        "vcruntime140, wldap32 #27, ws2 #55/#56, EnumResourceNamesW, CreateIconFromResource, DnsFree resolve");
+
+  auto gdf_a = (int (TRT_STDCALL*)(u32, u32, const void*, const char*, char*, int))
+      trt_resolve_module(nullptr, "kernel32.dll", "GetDateFormatA", 0);
+  auto gtf_a = (int (TRT_STDCALL*)(u32, u32, const void*, const char*, char*, int))
+      trt_resolve_module(nullptr, "kernel32.dll", "GetTimeFormatA", 0);
+  char dtbuf[32]{}, tmbuf[32]{};
+  CHECK(gdf_a && gtf_a &&
+            gdf_a(0, 0, nullptr, nullptr, dtbuf, sizeof(dtbuf)) > 0 && dtbuf[0] &&
+            gtf_a(0, 0, nullptr, nullptr, tmbuf, sizeof(tmbuf)) > 0 && tmbuf[0],
+        "GetDateFormatA / GetTimeFormatA produce formatted ASCII strings");
+}
+
 }  // namespace
 
 int main() {
@@ -1333,6 +1507,7 @@ int main() {
   test_wave2d_vmem_jit();
   test_wave2e_sys_net_d3d9();
   test_wave2f_dxgi_abi();
+  test_wave2g_proton_compat();
 
   printf("\nRESULT: %s\n", g_failures ? "FAIL" : "ALL PASS");
   return g_failures ? 1 : 0;

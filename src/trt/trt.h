@@ -252,6 +252,9 @@ void* trt_resolve_module(void* user, const char* module, const char* symbol,
                          u16 ordinal);
 // Optional runtime lookup. Only an actual registered/native export is returned.
 void* trt_resolve_export(const char* module, const char* symbol, u16 ordinal);
+// Fallback lookup inside a registered SYSTEM-route module table without
+// invoking g_system_load. Used by offline harnesses before blanket-0 fallbacks.
+void* trt_module_system_fallback(const char* module, const char* symbol);
 extern void trt_stub_thunk(void);
 
 // Register the module coverage a real PC game imports (SYSTEM/STUB routes).

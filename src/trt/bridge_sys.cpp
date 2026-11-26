@@ -131,6 +131,30 @@ u32 TRT_STDCALL trt_GetVersionExW(void* info) {
   return 1;
 }
 
+u32 TRT_STDCALL trt_GetVersionExA(void* info) {
+  if (!info) return 0;
+  int mj = 10, mn = 0, bd = 19045;
+  if (trt_settings_os) trt_settings_os(&mj, &mn, &bd);
+  u32* p = (u32*)info;
+  const u32 caller_sz = p[0];
+  p[0] = caller_sz ? caller_sz : 148u;
+  p[1] = (u32)mj;
+  p[2] = (u32)mn;
+  p[3] = (u32)bd;
+  p[4] = 2;     // VER_PLATFORM_WIN32_NT
+  if (caller_sz == 0 || caller_sz >= 148u) {
+    memset((u8*)info + 20, 0, 128);  // szCSDVersion
+  }
+  if (caller_sz >= 156u) {           // OSVERSIONINFOEXA
+    *(u16*)((u8*)info + 148) = 0;    // wServicePackMajor
+    *(u16*)((u8*)info + 150) = 0;    // wServicePackMinor
+    *(u16*)((u8*)info + 152) = 0x100u; // VER_SUITE_SINGLEUSERTS
+    ((u8*)info)[154] = 1;            // VER_NT_WORKSTATION
+    ((u8*)info)[155] = 0;
+  }
+  return 1;
+}
+
 u32 TRT_STDCALL trt_GetVersion(void) {
   int mj = 10, mn = 0, bd = 19045;
   if (trt_settings_os) trt_settings_os(&mj, &mn, &bd);
@@ -540,15 +564,49 @@ int TRT_STDCALL trt_CopyFileW(const u16* src, const u16* dst, bool fail) {
   return 1;
 }
 
+u32 TRT_STDCALL trt_GetWindowsDirectoryA(char* buf, u32 size) {
+  const char* w = "C:\\Windows";
+  const u32 len = (u32)strlen(w);
+  if (buf && size > len) {
+    memcpy(buf, w, len + 1);
+    return len;
+  }
+  return len + 1;
+}
+
+u32 TRT_STDCALL trt_ExpandEnvironmentStringsA(const char* src, char* dst,
+                                              u32 size) {
+  if (!src) return 0;
+  u16 wsrc[2048]{};
+  size_t i = 0;
+  for (; src[i] && i < 2047; ++i) wsrc[i] = (u16)(u8)src[i];
+  wsrc[i] = 0;
+  u16 wdst[2048]{};
+  const u32 need = trt_ExpandEnvironmentStringsW(wsrc, wdst, 2048);
+  if (need == 0 || need > 2048) return need;
+  if (dst && size >= need) {
+    for (u32 k = 0; k < need; ++k) dst[k] = (char)(u8)wdst[k];
+  }
+  return need;
+}
+
+int TRT_STDCALL trt_CreateDirectoryExW(const u16* tpl, const u16* path,
+                                       void* sa) {
+  (void)tpl;
+  return trt_CreateDirectoryW(path, sa);
+}
+
 int trt_bridge_register_system(void) {
   static const trt_named_fn k_fns[] = {
       {"GetVersionExW", (void*)&trt_GetVersionExW},
+      {"GetVersionExA", (void*)&trt_GetVersionExA},
       {"GetVersion", (void*)&trt_GetVersion},
       {"GetSystemInfo", (void*)&trt_GetSystemInfo},
       {"GetNativeSystemInfo", (void*)&trt_GetNativeSystemInfo},
       {"GetSystemTimes", (void*)&trt_GetSystemTimes},
       {"GetEnvironmentVariableW", (void*)&trt_GetEnvironmentVariableW},
       {"ExpandEnvironmentStringsW", (void*)&trt_ExpandEnvironmentStringsW},
+      {"ExpandEnvironmentStringsA", (void*)&trt_ExpandEnvironmentStringsA},
       {"GetACP", (void*)&trt_GetACP},
       {"GetOEMCP", (void*)&trt_GetOEMCP},
       {"GetUserDefaultLCID", (void*)&trt_GetUserDefaultLCID},
@@ -564,10 +622,12 @@ int trt_bridge_register_system(void) {
       {"GetTempPath2W", (void*)&trt_GetTempPathW},
       {"GetTempFileNameW", (void*)&trt_GetTempFileNameW},
       {"GetWindowsDirectoryW", (void*)&trt_GetWindowsDirectoryW},
+      {"GetWindowsDirectoryA", (void*)&trt_GetWindowsDirectoryA},
       {"GetFileAttributesW", (void*)&trt_GetFileAttributesW},
       {"SetFileAttributesW", (void*)&trt_SetFileAttributesW},
       {"DeleteFileW", (void*)&trt_DeleteFileW},
       {"CreateDirectoryW", (void*)&trt_CreateDirectoryW},
+      {"CreateDirectoryExW", (void*)&trt_CreateDirectoryExW},
       {"RemoveDirectoryW", (void*)&trt_RemoveDirectoryW},
       {"CopyFileW", (void*)&trt_CopyFileW},
   };

@@ -667,6 +667,27 @@ int trt_module_query_ordinal(const char* module, u16 ordinal) {
   return 0;
 }
 
+void* trt_module_system_fallback(const char* module, const char* symbol) {
+  load_shims_if_needed();
+  if (!module || !symbol) return nullptr;
+  const char* target = trt_apiset_target(module);
+  if (!target) target = module;
+  auto lookup_in = [&](const char* mod_name) -> void* {
+    const int mi = find_module(mod_name);
+    if (mi < 0) return nullptr;
+    const builtin_mod& m = g_modules[mi];
+    if (m.route != TRT_ROUTE_SYSTEM) return nullptr;
+    for (int i = 0; i < m.fn_count; ++i)
+      if (strcmp(m.fns[i].name, symbol) == 0) return (void*)m.fns[i].fn;
+    return nullptr;
+  };
+  if (void* fn = lookup_in(target)) return fn;
+  if (const char* alias = dll_alias_lookup(target)) {
+    if (void* fn2 = lookup_in(alias)) return fn2;
+  }
+  return nullptr;
+}
+
 void trt_set_system_loader(trt_system_load fn) { g_system_load = fn; }
 
 void trt_resolver_default(trt_resolver* out) {

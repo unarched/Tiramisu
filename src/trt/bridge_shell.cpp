@@ -278,6 +278,10 @@ int TRT_GUEST_ABI shell_ShellExecuteExW(void* info) {
   return 0;  // FALSE: the caller checks and falls back
 }
 
+int TRT_GUEST_ABI shell_ShellExecuteExA(void* info) {
+  return shell_ShellExecuteExW(info);
+}
+
 void* TRT_GUEST_ABI shell_ShellExecuteW(void* hwnd, const u16* verb,
                                         const u16* file, const u16* args,
                                         const u16* dir, int show) {
@@ -663,6 +667,7 @@ int trt_bridge_register_shell(void) {
       {"SHGetKnownFolderPath", (void*)&shell_SHGetKnownFolderPath},
       {"SHGetMalloc", (void*)&shell_SHGetMalloc},
       {"ShellExecuteExW", (void*)&shell_ShellExecuteExW},
+      {"ShellExecuteExA", (void*)&shell_ShellExecuteExA},
       {"ShellExecuteW", (void*)&shell_ShellExecuteW},
       {"ILFree", (void*)&shell_ILFree},
       {"SHCreateDirectoryExW", (void*)&shell_SHCreateDirectoryExW},

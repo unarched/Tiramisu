@@ -31,6 +31,7 @@ int TRT_STDCALL trt_CommitTransaction(void* handle);
 int TRT_STDCALL trt_RollbackTransaction(void* handle);
 int TRT_STDCALL trt_GetTransactionId(void* handle, void* guid_out);
 u32 TRT_STDCALL trt_GetLastError(void);
+void* trt_ws2_resolve(const char* symbol);
 }
 
 namespace {
@@ -277,6 +278,79 @@ int main(int argc, char** argv) {
           "ktmw32: commit on a garbage handle -> FALSE + ERROR_INVALID_HANDLE");
     CHECK(trt_RollbackTransaction(tx) == 0 && trt_GetLastError() == 120,
           "ktmw32: rollback -> FALSE + ERROR_CALL_NOT_IMPLEMENTED (named)");
+  }
+
+  // corpus-measured Win32 ANSI & Proton-parity exports resolve & behave honestly
+  {
+    const char* k32_syms[] = {
+        "GetVersionExA", "GetDriveTypeA", "GetFullPathNameA",
+        "FindFirstFileExA", "GetWindowsDirectoryA", "ExpandEnvironmentStringsA",
+        "GetDiskFreeSpaceExA", "VerifyVersionInfoA", "GlobalMemoryStatus",
+        "GetSystemTimeAdjustment", "SetSystemTime", "SetThreadExecutionState",
+        "FreeLibraryWhenCallbackReturns", "SignalObjectAndWait",
+        "CreateDirectoryExW", "GetFileInformationByHandleExW",
+        "SetFileInformationByHandleW", "GetEnvironmentStrings",
+        "GetStringTypeA", "LCMapStringA", "lstrcpyA",
+    };
+    for (const char* s : k32_syms) {
+      CHECK(trt_resolve_module(nullptr, "kernel32.dll", s, 0) != nullptr, s);
+    }
+    CHECK(trt_resolve_module(nullptr, "advapi32.dll", "RegisterEventSourceA", 0) != nullptr,
+          "advapi32: RegisterEventSourceA resolves");
+    CHECK(trt_resolve_module(nullptr, "advapi32.dll", "ReportEventA", 0) != nullptr,
+          "advapi32: ReportEventA resolves");
+    CHECK(trt_resolve_module(nullptr, "advapi32.dll", "RegCreateKeyTransactedW", 0) != nullptr,
+          "advapi32: RegCreateKeyTransactedW resolves");
+    CHECK(trt_resolve_module(nullptr, "winhttp.dll", "WinHttpSetStatusCallback", 0) != nullptr,
+          "winhttp: WinHttpSetStatusCallback resolves");
+    CHECK(trt_ws2_resolve("WSARecvFrom") != nullptr,
+          "ws2_32: trt_ws2_resolve(WSARecvFrom) resolves");
+
+    using fn_get_ver_a = u32 (TRT_STDCALL *)(void*);
+    auto get_ver_a = reinterpret_cast<fn_get_ver_a>(
+        trt_resolve_module(nullptr, "kernel32.dll", "GetVersionExA", 0));
+    u32 osvi[39] = {};  // 156 bytes (OSVERSIONINFOEXA)
+    osvi[0] = sizeof(osvi);
+    CHECK(get_ver_a(osvi) == 1 && osvi[1] == 10 && osvi[4] == 2,
+          "GetVersionExA reports Win10 NT");
+
+    using fn_exec_state = u32 (TRT_STDCALL *)(u32);
+    auto set_exec = reinterpret_cast<fn_exec_state>(
+        trt_resolve_module(nullptr, "kernel32.dll", "SetThreadExecutionState", 0));
+    u32 prev_es = set_exec(0x80000003u /*ES_CONTINUOUS|DISPLAY|SYSTEM*/);
+    CHECK(prev_es != 0, "SetThreadExecutionState returns non-zero previous state");
+    CHECK(set_exec(0x80000000u) == 0x80000003u,
+          "SetThreadExecutionState tracks updated execution state");
+
+    using fn_mem = void (TRT_STDCALL *)(void*);
+    auto glob_mem = reinterpret_cast<fn_mem>(
+        trt_resolve_module(nullptr, "kernel32.dll", "GlobalMemoryStatus", 0));
+    u32 ms32[8] = {};
+    ms32[0] = 32u;
+    glob_mem(ms32);
+    CHECK(ms32[1] == 25u && ms32[2] > 0, "GlobalMemoryStatus handles 32-bit struct");
+
+    using fn_adj = int (TRT_STDCALL *)(u32*, u32*, int*);
+    auto get_adj = reinterpret_cast<fn_adj>(
+        trt_resolve_module(nullptr, "kernel32.dll", "GetSystemTimeAdjustment", 0));
+    u32 ta = 0, ti = 0;
+    int dis = 0;
+    CHECK(get_adj(&ta, &ti, &dis) == 1 && ta > 0 && ti > 0 && dis == 1,
+          "GetSystemTimeAdjustment reports valid clock increment");
+
+    using fn_full_a = u32 (TRT_STDCALL *)(const char*, u32, char*, char**);
+    auto full_a = reinterpret_cast<fn_full_a>(
+        trt_resolve_module(nullptr, "kernel32.dll", "GetFullPathNameA", 0));
+    char fp_buf[260] = {};
+    char* fp_part = nullptr;
+    u32 fp_len = full_a("C:\\Temp\\demo.txt", sizeof(fp_buf), fp_buf, &fp_part);
+    CHECK(fp_len > 0 && strcmp(fp_buf, "C:\\Temp\\demo.txt") == 0 &&
+              fp_part && strcmp(fp_part, "demo.txt") == 0,
+          "GetFullPathNameA resolves full path and filepart");
+
+    CHECK(trt_resolve_module(nullptr, "dstorage.dll", "DStorageGetFactory", 0) != nullptr &&
+              trt_resolve_module(nullptr, "oo2core_6_win64.dll", "OodleLZ_Decompress", 0) != nullptr,
+          "kernel32 boot registers dstorage + oodle fallbacks");
   }
 
   if (failures) {

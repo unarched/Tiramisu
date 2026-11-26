@@ -18,11 +18,14 @@ namespace mileslog { static void line(const char* s) { trt_core_log(s); } }
 extern "C" {
 
 static const int MILES_SUCCESS = 1;
+static unsigned long long s_miles_sample = 0x77100001;
+static unsigned long long s_miles_stream = 0x77100002;
+static unsigned long long s_miles_provider = 0x77100003;
 
 // Core
 int TRT_GUEST_ABI miles_AIL_startup(void) { log_line("miles: AIL_startup (stub)"); return MILES_SUCCESS; }
 int TRT_GUEST_ABI miles_AIL_shutdown(void) { return MILES_SUCCESS; }
-void* TRT_GUEST_ABI miles_AIL_allocate_sample_handle(void* dig) { return nullptr; }
+void* TRT_GUEST_ABI miles_AIL_allocate_sample_handle(void* dig) { return (void*)&s_miles_sample; }
 int TRT_GUEST_ABI miles_AIL_free_sample_handle(void* sam) { return MILES_SUCCESS; }
 void* TRT_GUEST_ABI miles_AIL_open_digital_driver(unsigned rate, unsigned bits, int channels, unsigned flags) { return (void*)1; }
 int TRT_GUEST_ABI miles_AIL_close_digital_driver(void* dig) { return MILES_SUCCESS; }
@@ -36,11 +39,11 @@ int TRT_GUEST_ABI miles_AIL_load_sample_buffer(void* sam, unsigned index, const 
 int TRT_GUEST_ABI miles_AIL_service(void) { return MILES_SUCCESS; }
 
 // 3D audio
-void* TRT_GUEST_ABI miles_AIL_3D_provider_open(void* dig, const char* name) { return nullptr; }
+void* TRT_GUEST_ABI miles_AIL_3D_provider_open(void* dig, const char* name) { return (void*)&s_miles_provider; }
 int TRT_GUEST_ABI miles_AIL_3D_provider_close(void* prov) { return MILES_SUCCESS; }
 
 // Stream
-void* TRT_GUEST_ABI miles_AIL_open_stream(void* dig, const char* filename, int stream_flags) { return nullptr; }
+void* TRT_GUEST_ABI miles_AIL_open_stream(void* dig, const char* filename, int stream_flags) { return (void*)&s_miles_stream; }
 int TRT_GUEST_ABI miles_AIL_close_stream(void* stream) { return MILES_SUCCESS; }
 int TRT_GUEST_ABI miles_AIL_start_stream(void* stream) { return MILES_SUCCESS; }
 int TRT_GUEST_ABI miles_AIL_stop_stream(void* stream) { return MILES_SUCCESS; }

@@ -1094,6 +1094,23 @@ int TRT_STDCALL trt_GetDateFormatW(u32 lcid, u32 flags, const u16* date_in,
   return trt_GetDateFormatEx(nullptr, flags, date_in, fmt, out, cch, nullptr);
 }
 
+int TRT_STDCALL trt_GetDateFormatA(u32 lcid, u32 flags, const void* date_in,
+                                   const char* fmt, char* out, int cch) {
+  (void)lcid; (void)fmt;
+  u16 wfmt[64]{};
+  if (fmt) gap_ascii_to_u16(fmt, wfmt, 64);
+  u16 wout[64]{};
+  const int wlen = trt_GetDateFormatEx(nullptr, flags, (const u16*)date_in,
+                                       fmt ? wfmt : nullptr,
+                                       cch > 0 ? wout : nullptr,
+                                       cch > 0 ? (cch < 64 ? cch : 64) : 0, nullptr);
+  if (wlen <= 0) return 0;
+  if (cch == 0 || !out) return wlen;
+  const int n = wlen < cch ? wlen : cch;
+  for (int i = 0; i < n; ++i) out[i] = (char)(wout[i] & 0xFFu);
+  return n;
+}
+
 int TRT_STDCALL trt_GetTimeFormatEx(const u16* locale, u32 flags,
                                     const u16* time_in, const u16* fmt,
                                     u16* out, int cch) {
@@ -1110,6 +1127,23 @@ int TRT_STDCALL trt_GetTimeFormatW(u32 lcid, u32 flags, const u16* time_in,
                                    const u16* fmt, u16* out, int cch) {
   (void)lcid;
   return trt_GetTimeFormatEx(nullptr, flags, time_in, fmt, out, cch);
+}
+
+int TRT_STDCALL trt_GetTimeFormatA(u32 lcid, u32 flags, const void* time_in,
+                                   const char* fmt, char* out, int cch) {
+  (void)lcid; (void)fmt;
+  u16 wfmt[64]{};
+  if (fmt) gap_ascii_to_u16(fmt, wfmt, 64);
+  u16 wout[64]{};
+  const int wlen = trt_GetTimeFormatEx(nullptr, flags, (const u16*)time_in,
+                                       fmt ? wfmt : nullptr,
+                                       cch > 0 ? wout : nullptr,
+                                       cch > 0 ? (cch < 64 ? cch : 64) : 0);
+  if (wlen <= 0) return 0;
+  if (cch == 0 || !out) return wlen;
+  const int n = wlen < cch ? wlen : cch;
+  for (int i = 0; i < n; ++i) out[i] = (char)(wout[i] & 0xFFu);
+  return n;
 }
 
 // ============================================================================
@@ -3499,6 +3533,301 @@ extern "C" unsigned TRT_GUEST_ABI trt_GetUserGeoID(int level) {
     return 0;  // GEOID_NOT_AVAILABLE
 }
 
+// ---- ANSI & Proton-parity kernel32 twins (corpus-measured gaps) -----------
+u32 TRT_STDCALL trt_GetDriveTypeA(const char* root) {
+  u16 w[32]{};
+  if (root) gap_ascii_to_u16(root, w, 32);
+  return trt_GetDriveTypeW(root ? w : nullptr);
+}
+
+u32 TRT_STDCALL trt_GetFullPathNameA(const char* name, u32 len, char* out,
+                                     char** filepart) {
+  if (filepart) *filepart = nullptr;
+  if (!name || !name[0]) return 0;
+  u16 wname[1024]{};
+  gap_ascii_to_u16(name, wname, 1024);
+  u16 wout[1024]{};
+  u16* wfp = nullptr;
+  const u32 need = trt_GetFullPathNameW(wname, 1024, wout, &wfp);
+  if (need == 0) return 0;
+  if (!out || len == 0 || len <= need) return need + 1;
+  for (u32 i = 0; i <= need; ++i) out[i] = (char)(u8)wout[i];
+  if (filepart && wfp && wfp >= wout && wfp <= wout + need) {
+    *filepart = out + (wfp - wout);
+  }
+  return need;
+}
+
+int TRT_STDCALL trt_GetDiskFreeSpaceExA(const char* dir, u64* avail, u64* total,
+                                        u64* free_bytes) {
+  u16 w[1024]{};
+  if (dir) gap_ascii_to_u16(dir, w, 1024);
+  return trt_GetDiskFreeSpaceExW(dir ? w : nullptr, avail, total, free_bytes);
+}
+
+int TRT_STDCALL trt_VerifyVersionInfoA(const void* vi_in, u32 type_mask,
+                                       u64 cond_mask) {
+  if (!vi_in) { trt_SetLastError(87); return 0; }
+  struct osvi_ex_a {
+    u32 dwOSVersionInfoSize;
+    u32 dwMajorVersion;
+    u32 dwMinorVersion;
+    u32 dwBuildNumber;
+    u32 dwPlatformId;
+    char szCSDVersion[128];
+    u16 wServicePackMajor;
+    u16 wServicePackMinor;
+    u16 wSuiteMask;
+    u8 wProductType;
+    u8 wReserved;
+  };
+  struct osvi_ex_w {
+    u32 dwOSVersionInfoSize;
+    u32 dwMajorVersion;
+    u32 dwMinorVersion;
+    u32 dwBuildNumber;
+    u32 dwPlatformId;
+    u16 szCSDVersion[128];
+    u16 wServicePackMajor;
+    u16 wServicePackMinor;
+    u16 wSuiteMask;
+    u8 wProductType;
+    u8 wReserved;
+  } viw{};
+  const osvi_ex_a* a = (const osvi_ex_a*)vi_in;
+  viw.dwOSVersionInfoSize = sizeof(viw);
+  viw.dwMajorVersion = a->dwMajorVersion;
+  viw.dwMinorVersion = a->dwMinorVersion;
+  viw.dwBuildNumber = a->dwBuildNumber;
+  viw.dwPlatformId = a->dwPlatformId;
+  viw.wServicePackMajor = a->wServicePackMajor;
+  viw.wServicePackMinor = a->wServicePackMinor;
+  viw.wSuiteMask = a->wSuiteMask;
+  viw.wProductType = a->wProductType;
+  return trt_VerifyVersionInfoW(&viw, type_mask, cond_mask);
+}
+
+void TRT_STDCALL trt_GlobalMemoryStatus(void* ms_in) {
+  if (!ms_in) return;
+  const u32 len = *(const u32*)ms_in;
+  if (len == 32u) {  // PE32 32-bit MEMORYSTATUS
+    u32* ms = (u32*)ms_in;
+    ms[0] = 32u;
+    ms[1] = 25u;                 // dwMemoryLoad
+    ms[2] = 0x7FFF0000u;         // dwTotalPhys (~2GB Win32 cap)
+    ms[3] = 0x7FFF0000u;         // dwAvailPhys
+    ms[4] = 0x7FFF0000u;         // dwTotalPageFile
+    ms[5] = 0x7FFF0000u;         // dwAvailPageFile
+    ms[6] = 0x7FFE0000u;         // dwTotalVirtual
+    ms[7] = 0x7FF00000u;         // dwAvailVirtual
+    return;
+  }
+  struct mem_status64 {
+    u32 dwLength; u32 dwMemoryLoad;
+    u64 dwTotalPhys, dwAvailPhys;
+    u64 dwTotalPageFile, dwAvailPageFile;
+    u64 dwTotalVirtual, dwAvailVirtual;
+  };
+  mem_status64* ms = (mem_status64*)ms_in;
+  const u64 gb = 1024ULL * 1024ULL * 1024ULL;
+  ms->dwLength = (len >= sizeof(mem_status64)) ? len : (u32)sizeof(mem_status64);
+  ms->dwMemoryLoad = 25u;
+  ms->dwTotalPhys = 8ULL * gb;
+  ms->dwAvailPhys = 6ULL * gb;
+  ms->dwTotalPageFile = 8ULL * gb;
+  ms->dwAvailPageFile = 6ULL * gb;
+  ms->dwTotalVirtual = 0x7FFFFFFE0000ULL;
+  ms->dwAvailVirtual = 0x7FF000000000ULL;
+}
+
+int TRT_STDCALL trt_GetSystemTimeAdjustment(u32* time_adj, u32* time_inc,
+                                            int* disabled) {
+  if (!time_adj || !time_inc || !disabled) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  *time_adj = 156250u;   // 15.625ms in 100ns units
+  *time_inc = 156250u;
+  *disabled = 1;         // periodic time adjustment disabled
+  return 1;
+}
+
+int TRT_STDCALL trt_SetSystemTime(const void* st) {
+  (void)st;
+  LOG("kernel32: SetSystemTime -> FALSE (ERROR_PRIVILEGE_NOT_HELD: sandboxed console)");
+  trt_SetLastError(1314);  // ERROR_PRIVILEGE_NOT_HELD
+  return 0;
+}
+
+u32 TRT_STDCALL trt_SetThreadExecutionState(u32 flags) {
+  static std::atomic<u32> s_exec_state{0x80000000u};  // ES_CONTINUOUS
+  if (flags == 0) return s_exec_state.load(std::memory_order_relaxed);
+  if (flags & 0x80000000u) {
+    return s_exec_state.exchange(flags, std::memory_order_relaxed);
+  }
+  return s_exec_state.load(std::memory_order_relaxed);
+}
+
+static u32 g_proc_priority_class = 0x00000020u;  // NORMAL_PRIORITY_CLASS
+
+int TRT_STDCALL trt_CreateDirectoryA(const char* path, void* sa) {
+  if (!path) { trt_SetLastError(87); return 0; }
+  std::vector<u16> w(strlen(path) + 1);
+  gap_ascii_to_u16(path, w.data(), w.size());
+  return trt_CreateDirectoryW(w.data(), sa);
+}
+
+int TRT_STDCALL trt_MoveFileA(const char* src, const char* dst) {
+  if (!src || !dst) { trt_SetLastError(87); return 0; }
+  std::vector<u16> ws(strlen(src) + 1), wd(strlen(dst) + 1);
+  gap_ascii_to_u16(src, ws.data(), ws.size());
+  gap_ascii_to_u16(dst, wd.data(), wd.size());
+  return trt_MoveFileW(ws.data(), wd.data());
+}
+
+u32 TRT_STDCALL trt_GetPriorityClass(void* proc) {
+  (void)proc;
+  return g_proc_priority_class;
+}
+
+int TRT_STDCALL trt_SetPriorityClass(void* proc, u32 cls) {
+  (void)proc;
+  g_proc_priority_class = cls ? cls : 0x20u;
+  return 1;
+}
+
+int TRT_STDCALL trt_GetProcessWorkingSetSize(void* proc, u64* min_ws, u64* max_ws) {
+  u32 dummy = 0;
+  return trt_GetProcessWorkingSetSizeEx(proc, min_ws, max_ws, &dummy);
+}
+
+int TRT_STDCALL trt_SetProcessWorkingSetSize(void* proc, u64 min_ws, u64 max_ws) {
+  return trt_SetProcessWorkingSetSizeEx(proc, min_ws, max_ws, 0);
+}
+
+u32 TRT_STDCALL trt_SetHandleCount(u32 num) { return num; }
+
+void* TRT_STDCALL trt_OpenFile(const char* name, void* of_struct, u32 style) {
+  if (!name || !of_struct) { trt_SetLastError(87); return (void*)(intptr_t)-1; }
+  extern void* TRT_STDCALL trt_CreateFileA(const char*, u32, u32, void*, u32, u32, void*);
+  // OF_EXIST (0x4000) / OF_READ (0) / OF_READWRITE (2) / OF_CREATE (0x1000)
+  u32 access = 0x80000000u;  // GENERIC_READ
+  if ((style & 3u) == 1u) access = 0x40000000u;
+  else if ((style & 3u) == 2u) access = 0xC0000000u;
+  u32 disp = (style & 0x1000u) ? 2u /*CREATE_ALWAYS*/ : 3u /*OPEN_EXISTING*/;
+  if (style & 0x4000u /*OF_EXIST*/) access = 0x80000000u;
+  void* h = trt_CreateFileA(name, access, 7u, nullptr, disp, 0x80u, nullptr);
+  u8* ofs = (u8*)of_struct;
+  ofs[0] = 136;  // cBytes = sizeof(OFSTRUCT)
+  ofs[1] = 0;
+  u16* errp = (u16*)(ofs + 2);
+  *errp = (h == (void*)(intptr_t)-1) ? (u16)2 : (u16)0;
+  snprintf((char*)(ofs + 8), 128, "%s", name);
+  if ((style & 0x4000u) && h != (void*)(intptr_t)-1) {
+    extern int TRT_STDCALL trt_CloseHandle(void*);
+    trt_CloseHandle(h);
+    return (void*)(uintptr_t)1;
+  }
+  return h;
+}
+
+int TRT_STDCALL trt_ReadDirectoryChangesW(
+    void* dir, void* buf, u32 len, int watch_subtree, u32 notify_filter,
+    u32* bytes_ret, void* overlapped, void* completion) {
+  (void)dir; (void)buf; (void)len; (void)watch_subtree;
+  (void)notify_filter; (void)overlapped; (void)completion;
+  if (bytes_ret) *bytes_ret = 0;
+  trt_SetLastError(50);  // ERROR_NOT_SUPPORTED (console VFS does not push dir watches)
+  return 0;
+}
+
+int TRT_STDCALL trt_RtlInstallFunctionTableCallback(
+    u64 table_id, u64 base_addr, u32 length, void* callback, void* context,
+    const u16* out_of_proc_dll) {
+  (void)table_id; (void)base_addr; (void)length; (void)callback;
+  (void)context; (void)out_of_proc_dll;
+  return 1;
+}
+
+int TRT_STDCALL trt_FlushConsoleInputBuffer(void* h) {
+  return gap_is_std_handle(h) ? 1 : (trt_SetLastError(6), 0);
+}
+
+int TRT_STDCALL trt_ReadConsoleInputA(void* h, void* buf, u32 len, u32* read) {
+  return trt_ReadConsoleInputW(h, buf, len, read);
+}
+
+int TRT_STDCALL trt_ReadConsoleA(void* h, void* buf, u32 to_read, u32* read, void* ctrl) {
+  (void)h; (void)buf; (void)to_read; (void)ctrl;
+  if (read) *read = 0;
+  trt_SetLastError(6);  // no console attached in AppContainer
+  return 0;
+}
+
+int TRT_STDCALL trt_SetConsoleTextAttribute(void* h, u16 attr) {
+  (void)attr;
+  return gap_is_std_handle(h) ? 1 : (trt_SetLastError(6), 0);
+}
+
+int TRT_STDCALL trt_SetConsoleTitleW(const u16* title) {
+  (void)title;
+  return 1;
+}
+
+int TRT_STDCALL trt_SetConsoleScreenBufferSize(void* h, u32 size_packed) {
+  (void)size_packed;
+  return gap_is_std_handle(h) ? 1 : (trt_SetLastError(6), 0);
+}
+
+int TRT_STDCALL trt_SetConsoleOutputCP(u32 cp) {
+  (void)cp;
+  return 1;
+}
+
+int TRT_STDCALL trt_TransactNamedPipe(void* pipe, void* in_buf, u32 in_sz,
+                                      void* out_buf, u32 out_sz, u32* read,
+                                      void* overlapped) {
+  (void)pipe; (void)in_buf; (void)in_sz; (void)out_buf; (void)out_sz;
+  (void)overlapped;
+  if (read) *read = 0;
+  trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+  return 0;
+}
+
+int TRT_STDCALL trt_QueryFullProcessImageNameW(void* proc, u32 flags,
+                                               u16* exe_name, u32* size) {
+  (void)proc; (void)flags;
+  if (!exe_name || !size || *size == 0) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  const u32 cap = *size;
+  const u32 got = trt_GetModuleFileNameW(nullptr, exe_name, cap);
+  if (got == 0 || got >= cap - 1) {
+    trt_SetLastError(122);  // ERROR_INSUFFICIENT_BUFFER
+    return 0;
+  }
+  *size = got;
+  return 1;
+}
+
+int TRT_STDCALL trt_QueryFullProcessImageNameA(void* proc, u32 flags,
+                                               char* exe_name, u32* size) {
+  (void)proc; (void)flags;
+  if (!exe_name || !size || *size == 0) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  const u32 cap = *size;
+  const u32 got = trt_GetModuleFileNameA(nullptr, exe_name, cap);
+  if (got == 0 || got >= cap - 1) {
+    trt_SetLastError(122);
+    return 0;
+  }
+  *size = got;
+  return 1;
+}
+
 static const trt_named_fn k_gap_fns[] = {
   {"IsWow64Process", (void*)&trt_IsWow64Process},
   {"IsWow64Process2", (void*)&trt_IsWow64Process2},
@@ -3561,8 +3890,10 @@ static const trt_named_fn k_gap_fns[] = {
   {"GetLocaleInfoW", (void*)&trt_GetLocaleInfoW},
   {"GetDateFormatEx", (void*)&trt_GetDateFormatEx},
   {"GetDateFormatW", (void*)&trt_GetDateFormatW},
+  {"GetDateFormatA", (void*)&trt_GetDateFormatA},
   {"GetTimeFormatEx", (void*)&trt_GetTimeFormatEx},
   {"GetTimeFormatW", (void*)&trt_GetTimeFormatW},
+  {"GetTimeFormatA", (void*)&trt_GetTimeFormatA},
   {"GetUserDefaultUILanguage", (void*)&trt_GetUserDefaultUILanguage},
   {"GetSystemDefaultUILanguage", (void*)&trt_GetSystemDefaultUILanguage},
   {"GetThreadLocale", (void*)&trt_GetThreadLocale},
@@ -3749,6 +4080,36 @@ static const trt_named_fn k_gap_fns[] = {
   {"GetThreadStackGuarantee", (void*)&trt_GetThreadStackGuarantee},
   {"GetGeoInfoW", (void*)&trt_GetGeoInfoW},
   {"GetUserGeoID", (void*)&trt_GetUserGeoID},
+  {"GetDriveTypeA", (void*)&trt_GetDriveTypeA},
+  {"GetFullPathNameA", (void*)&trt_GetFullPathNameA},
+  {"GetDiskFreeSpaceExA", (void*)&trt_GetDiskFreeSpaceExA},
+  {"VerifyVersionInfoA", (void*)&trt_VerifyVersionInfoA},
+  {"GlobalMemoryStatus", (void*)&trt_GlobalMemoryStatus},
+  {"GetSystemTimeAdjustment", (void*)&trt_GetSystemTimeAdjustment},
+  {"SetSystemTime", (void*)&trt_SetSystemTime},
+  {"SetThreadExecutionState", (void*)&trt_SetThreadExecutionState},
+  {"GetFileInformationByHandleExW", (void*)&trt_GetFileInformationByHandleEx},
+  {"SetFileInformationByHandleW", (void*)&trt_SetFileInformationByHandle},
+  {"CreateDirectoryA", (void*)&trt_CreateDirectoryA},
+  {"MoveFileA", (void*)&trt_MoveFileA},
+  {"GetPriorityClass", (void*)&trt_GetPriorityClass},
+  {"SetPriorityClass", (void*)&trt_SetPriorityClass},
+  {"GetProcessWorkingSetSize", (void*)&trt_GetProcessWorkingSetSize},
+  {"SetProcessWorkingSetSize", (void*)&trt_SetProcessWorkingSetSize},
+  {"SetHandleCount", (void*)&trt_SetHandleCount},
+  {"OpenFile", (void*)&trt_OpenFile},
+  {"ReadDirectoryChangesW", (void*)&trt_ReadDirectoryChangesW},
+  {"RtlInstallFunctionTableCallback", (void*)&trt_RtlInstallFunctionTableCallback},
+  {"FlushConsoleInputBuffer", (void*)&trt_FlushConsoleInputBuffer},
+  {"ReadConsoleInputA", (void*)&trt_ReadConsoleInputA},
+  {"ReadConsoleA", (void*)&trt_ReadConsoleA},
+  {"SetConsoleTextAttribute", (void*)&trt_SetConsoleTextAttribute},
+  {"SetConsoleTitleW", (void*)&trt_SetConsoleTitleW},
+  {"SetConsoleScreenBufferSize", (void*)&trt_SetConsoleScreenBufferSize},
+  {"SetConsoleOutputCP", (void*)&trt_SetConsoleOutputCP},
+  {"TransactNamedPipe", (void*)&trt_TransactNamedPipe},
+  {"QueryFullProcessImageNameW", (void*)&trt_QueryFullProcessImageNameW},
+  {"QueryFullProcessImageNameA", (void*)&trt_QueryFullProcessImageNameA},
 };
 
 // registered by trt_bridge_register_kernel32 after the core table

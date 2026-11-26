@@ -21,10 +21,31 @@ namespace binklog { static void line(const char* s) { trt_core_log(s); } }
 
 extern "C" {
 
-// Bink handle is opaque; we never allocate one.
+struct BinkHeader {
+    unsigned int Width;
+    unsigned int Height;
+    unsigned int Frames;
+    unsigned int FrameNum;
+    unsigned int LastFrameNum;
+    unsigned int FrameRate;
+    unsigned int FrameRateDiv;
+    unsigned int ReadError;
+    unsigned int OpenFlags;
+    unsigned int BinkType;
+    unsigned int Size;
+    unsigned int FrameSize;
+    unsigned int SndSize;
+    unsigned int NumTracks;
+};
+
+static BinkHeader s_dummy_bink = {
+    1920, 1080, 1, 1, 1, 30, 1, 0, 0, 0, 0, 0, 0, 0
+};
+
+// Bink handle is opaque; return dummy structure so games do not crash on field reads.
 void* TRT_GUEST_ABI bink_BinkOpen(const void* file, unsigned flags) {
-    log_line("bink: BinkOpen -> NULL (Bink not implemented; video skipped)");
-    return nullptr;
+    log_line("bink: BinkOpen -> dummy handle (video skipped cleanly)");
+    return &s_dummy_bink;
 }
 
 int TRT_GUEST_ABI bink_BinkClose(void* bnk) {
@@ -62,8 +83,8 @@ int TRT_GUEST_ABI bink_BinkSetPan(void* bnk, int track, int pan) { return 0; }
 int TRT_GUEST_ABI bink_BinkSetMixBins(void* bnk, int track, unsigned* bins, int nbins) { return 0; }
 int TRT_GUEST_ABI bink_BinkSetMixBinVolumes(void* bnk, int track, unsigned* bins, int* volumes, int nbins) { return 0; }
 int TRT_GUEST_ABI bink_BinkPause(void* bnk, int pause) { return 0; }
-unsigned TRT_GUEST_ABI bink_BinkGetFrameNum(void* bnk) { return 0; }
-unsigned TRT_GUEST_ABI bink_BinkGetKeyFrame(void* bnk) { return 0; }
+unsigned TRT_GUEST_ABI bink_BinkGetFrameNum(void* bnk) { return s_dummy_bink.FrameNum; }
+unsigned TRT_GUEST_ABI bink_BinkGetKeyFrame(void* bnk) { return 1; }
 int TRT_GUEST_ABI bink_BinkShouldSkip(void* bnk) { return 1; } // always skip
 int TRT_GUEST_ABI bink_BinkGetVideoInfo(void* bnk, void* info) { return 0; }
 int TRT_GUEST_ABI bink_BinkGetAudioInfo(void* bnk, void* info) { return 0; }
@@ -80,7 +101,10 @@ void* TRT_GUEST_ABI bink_BinkAllocateFrameBuffers(void* bnk, void* fb) { return 
 void TRT_GUEST_ABI bink_BinkFreeFrameBuffers(void* bnk) {}
 
 // Bink I/O
-void* TRT_GUEST_ABI bink_BinkOpenDirect(const char* name, unsigned flags) { return nullptr; }
+void* TRT_GUEST_ABI bink_BinkOpenDirect(const char* name, unsigned flags) {
+    log_line("bink: BinkOpenDirect -> dummy handle (video skipped cleanly)");
+    return &s_dummy_bink;
+}
 
 }  // extern "C"
 

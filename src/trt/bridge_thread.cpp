@@ -6147,6 +6147,49 @@ void TRT_STDCALL trt_ReleaseSemaphoreWhenCallbackReturns(void* inst, u64 sem,
 void TRT_STDCALL trt_SetEventWhenCallbackReturns(void* inst, u64 ev) {
   if (inst) ((tp_callback_inst*)inst)->cleanup_ev = ev;
 }
+void TRT_STDCALL trt_FreeLibraryWhenCallbackReturns(void* inst, void* mod) {
+  (void)inst; (void)mod;
+}
+
+u32 TRT_STDCALL trt_SignalObjectAndWait(u64 h_signal, u64 h_wait, u32 ms,
+                                        int alertable) {
+  {
+    std::lock_guard<std::mutex> lk(g_obj_mu);
+    sync_object* o = object_for_locked(h_signal);
+    if (!o) {
+      trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+      return 0xFFFFFFFFu;   // WAIT_FAILED
+    }
+    if (o->kind == OBJ_EVENT) {
+      o->signalled = true;
+      o->last_set_tid = current_tid();
+      ++o->set_count;
+      g_sync_cv.notify_all();
+    } else if (o->kind == OBJ_MUTEX) {
+      if (o->lock_count <= 0) {
+        trt_SetLastError(288);  // ERROR_NOT_OWNER
+        return 0xFFFFFFFFu;
+      }
+      --o->lock_count;
+      o->last_set_tid = current_tid();
+      ++o->set_count;
+      if (o->lock_count == 0) {
+        o->owner_tid = 0;
+        g_sync_cv.notify_all();
+      }
+    } else if (o->kind == OBJ_SEMAPHORE) {
+      ++o->lock_count;
+      o->last_set_tid = current_tid();
+      ++o->set_count;
+      g_sync_cv.notify_all();
+    } else {
+      trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+      return 0xFFFFFFFFu;
+    }
+  }
+  return wait_single_impl(h_wait, ms, alertable != 0,
+                          __builtin_return_address(0));
+}
 
 int TRT_STDCALL trt_RegisterWaitForSingleObject(void** out_wait, u64 h,
                                               void* cb, void* ctx, u32 ms,
@@ -6202,6 +6245,194 @@ int TRT_STDCALL trt_UnregisterWaitEx(void* wait_ptr, u64 comp_event) {
 
 int TRT_STDCALL trt_UnregisterWait(void* wait_ptr) {
   return trt_UnregisterWaitEx(wait_ptr, 0);
+}
+
+// ---- Win32 Timer Queues (CreateTimerQueue / CreateTimerQueueTimer / etc.) ---
+struct timer_queue_item;
+
+struct timer_queue_obj {
+  std::mutex mu;
+  std::vector<timer_queue_item*> timers;
+};
+
+struct timer_queue_item {
+  timer_queue_obj* queue = nullptr;
+  void* cb = nullptr;
+  void* param = nullptr;
+  u32 due_ms = 0;
+  u32 period_ms = 0;
+  u32 flags = 0;
+  u64 generation = 0;
+  bool stop = false;
+  bool in_callback = false;
+  std::mutex mu;
+  std::condition_variable cv;
+  std::thread th;
+};
+
+static std::mutex g_tq_mu;
+static std::vector<timer_queue_obj*> g_tq_list;
+
+static timer_queue_obj* default_timer_queue() {
+  static timer_queue_obj* s_default_tq = []() {
+    auto* q = new timer_queue_obj();
+    std::lock_guard<std::mutex> lk(g_tq_mu);
+    g_tq_list.push_back(q);
+    return q;
+  }();
+  return s_default_tq;
+}
+
+static void timer_queue_worker(timer_queue_item* it) {
+  std::unique_lock<std::mutex> lk(it->mu);
+  bool first_shot = true;
+  while (!it->stop) {
+    const u64 gen = it->generation;
+    const u32 wait_ms = first_shot ? it->due_ms : it->period_ms;
+    if (wait_ms > 0) {
+      it->cv.wait_for(lk, std::chrono::milliseconds(wait_ms), [&]() {
+        return it->stop || it->generation != gen;
+      });
+    }
+    if (it->stop) break;
+    if (it->generation != gen) {
+      first_shot = true;
+      continue;
+    }
+    first_shot = false;
+    void* cb = it->cb;
+    void* param = it->param;
+    const u32 period = it->period_ms;
+    const u32 flags = it->flags;
+    it->in_callback = true;
+    lk.unlock();
+    if (cb) {
+      tp_run_guest_cb(cb, (u64)(uintptr_t)param, 1ULL /*TimerOrWaitFired*/,
+                      0, 0, nullptr);
+    }
+    lk.lock();
+    it->in_callback = false;
+    it->cv.notify_all();
+    if (it->stop) break;
+    // Period == 0 or WT_EXECUTEONLYONCE (0x08): fire once then park until
+    // ChangeTimerQueueTimer or deletion.
+    if (period == 0 || (flags & 0x08u)) {
+      const u64 done_gen = it->generation;
+      it->cv.wait(lk, [&]() { return it->stop || it->generation != done_gen; });
+      first_shot = true;
+    }
+  }
+}
+
+void* TRT_STDCALL trt_CreateTimerQueue(void) {
+  auto* q = new timer_queue_obj();
+  std::lock_guard<std::mutex> lk(g_tq_mu);
+  g_tq_list.push_back(q);
+  return q;
+}
+
+int TRT_STDCALL trt_DeleteTimerQueueTimer(void* queue, void* timer,
+                                          u64 comp_event) {
+  timer_queue_item* it = (timer_queue_item*)timer;
+  if (!it) { trt_SetLastError(87); return 0; }
+  timer_queue_obj* q = queue ? (timer_queue_obj*)queue : it->queue;
+  if (q) {
+    std::lock_guard<std::mutex> qlk(q->mu);
+    for (size_t i = 0; i < q->timers.size(); ++i) {
+      if (q->timers[i] == it) {
+        q->timers.erase(q->timers.begin() + (long long)i);
+        break;
+      }
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(it->mu);
+    it->stop = true;
+    ++it->generation;
+    it->cv.notify_all();
+  }
+  const bool wait_sync = (comp_event == (u64)(intptr_t)-1);
+  if (it->th.joinable()) {
+    if (wait_sync || comp_event != 0) {
+      it->th.join();
+      if (!wait_sync && comp_event) trt_SetEvent(comp_event);
+      delete it;
+      return 1;
+    } else {
+      // Async deletion without INVALID_HANDLE_VALUE: detach cleanup safely.
+      std::thread([it]() {
+        if (it->th.joinable()) it->th.join();
+        delete it;
+      }).detach();
+      return 1;
+    }
+  }
+  if (!wait_sync && comp_event) trt_SetEvent(comp_event);
+  delete it;
+  return 1;
+}
+
+int TRT_STDCALL trt_DeleteTimerQueueEx(void* queue, u64 comp_event) {
+  timer_queue_obj* q = (timer_queue_obj*)queue;
+  if (!q) { trt_SetLastError(6); return 0; }
+  std::vector<timer_queue_item*> pending;
+  {
+    std::lock_guard<std::mutex> qlk(q->mu);
+    pending.swap(q->timers);
+  }
+  for (timer_queue_item* it : pending) {
+    trt_DeleteTimerQueueTimer(nullptr, it, (u64)(intptr_t)-1);
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_tq_mu);
+    for (size_t i = 0; i < g_tq_list.size(); ++i) {
+      if (g_tq_list[i] == q) {
+        g_tq_list.erase(g_tq_list.begin() + (long long)i);
+        break;
+      }
+    }
+  }
+  if (comp_event && comp_event != (u64)(intptr_t)-1) trt_SetEvent(comp_event);
+  delete q;
+  return 1;
+}
+
+int TRT_STDCALL trt_DeleteTimerQueue(void* queue) {
+  return trt_DeleteTimerQueueEx(queue, 0);
+}
+
+int TRT_STDCALL trt_CreateTimerQueueTimer(void** phNewTimer, void* queue,
+                                          void* callback, void* parameter,
+                                          u32 due_time, u32 period, u32 flags) {
+  if (!phNewTimer || !callback) { trt_SetLastError(87); return 0; }
+  timer_queue_obj* q = queue ? (timer_queue_obj*)queue : default_timer_queue();
+  auto* it = new timer_queue_item();
+  it->queue = q;
+  it->cb = callback;
+  it->param = parameter;
+  it->due_ms = due_time;
+  it->period_ms = period;
+  it->flags = flags;
+  {
+    std::lock_guard<std::mutex> qlk(q->mu);
+    q->timers.push_back(it);
+  }
+  it->th = std::thread(timer_queue_worker, it);
+  *phNewTimer = it;
+  return 1;
+}
+
+int TRT_STDCALL trt_ChangeTimerQueueTimer(void* queue, void* timer,
+                                          u32 due_time, u32 period) {
+  (void)queue;
+  timer_queue_item* it = (timer_queue_item*)timer;
+  if (!it) { trt_SetLastError(87); return 0; }
+  std::lock_guard<std::mutex> lk(it->mu);
+  it->due_ms = due_time;
+  it->period_ms = period;
+  ++it->generation;
+  it->cv.notify_all();
+  return 1;
 }
 
 }  // extern "C"
@@ -6263,11 +6494,19 @@ int trt_bridge_register_threads(void) {
       {"ReleaseSemaphoreWhenCallbackReturns",
        (void*)&trt_ReleaseSemaphoreWhenCallbackReturns},
       {"SetEventWhenCallbackReturns", (void*)&trt_SetEventWhenCallbackReturns},
+      {"FreeLibraryWhenCallbackReturns",
+       (void*)&trt_FreeLibraryWhenCallbackReturns},
       {"RegisterWaitForSingleObject", (void*)&trt_RegisterWaitForSingleObject},
       {"RegisterWaitForSingleObjectEx",
        (void*)&trt_RegisterWaitForSingleObjectEx},
       {"UnregisterWait", (void*)&trt_UnregisterWait},
       {"UnregisterWaitEx", (void*)&trt_UnregisterWaitEx},
+      {"CreateTimerQueue", (void*)&trt_CreateTimerQueue},
+      {"DeleteTimerQueue", (void*)&trt_DeleteTimerQueue},
+      {"DeleteTimerQueueEx", (void*)&trt_DeleteTimerQueueEx},
+      {"CreateTimerQueueTimer", (void*)&trt_CreateTimerQueueTimer},
+      {"ChangeTimerQueueTimer", (void*)&trt_ChangeTimerQueueTimer},
+      {"DeleteTimerQueueTimer", (void*)&trt_DeleteTimerQueueTimer},
       {"CreateThread", (void*)&trt_CreateThread},
       {"ExitThread", (void*)&trt_ExitThread},
       {"TerminateThread", (void*)&trt_TerminateThread},
@@ -6275,6 +6514,7 @@ int trt_bridge_register_threads(void) {
       {"WaitForSingleObjectEx", (void*)&trt_WaitForSingleObjectEx},
       {"WaitForMultipleObjects", (void*)&trt_WaitForMultipleObjects},
       {"WaitForMultipleObjectsEx", (void*)&trt_WaitForMultipleObjectsEx},
+      {"SignalObjectAndWait", (void*)&trt_SignalObjectAndWait},
       {"SleepEx", (void*)&trt_SleepEx},
       {"SwitchToThread", (void*)&trt_SwitchToThread},
       {"GetExitCodeThread", (void*)&trt_GetExitCodeThread},

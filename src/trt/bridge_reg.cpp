@@ -1535,6 +1535,13 @@ void* TRT_GUEST_ABI trt_RegisterEventSourceW(const u16* server,
   return nullptr;
 }
 
+void* TRT_GUEST_ABI trt_RegisterEventSourceA(const char* server,
+                                             const char* source) {
+  (void)server; (void)source;
+  trt_core_log("advapi32: RegisterEventSourceA -> NULL (no event log)");
+  return nullptr;
+}
+
 int TRT_GUEST_ABI trt_DeregisterEventSource(void* hEventLog) {
   (void)hEventLog;
   return 1;  // nothing was ever registered
@@ -1551,6 +1558,25 @@ int TRT_GUEST_ABI trt_ReportEventW(void* hEventLog, u16 type, u16 category,
   return 0;
 }
 
+int TRT_GUEST_ABI trt_ReportEventA(void* hEventLog, u16 type, u16 category,
+                                   u32 event_id, void* user_sid,
+                                   u16 num_strings, u32 data_size,
+                                   const char** strings, void* data) {
+  (void)hEventLog; (void)type; (void)category; (void)event_id;
+  (void)user_sid; (void)num_strings; (void)data_size; (void)strings;
+  (void)data;
+  trt_core_log("advapi32: ReportEventA -> FALSE (no event log)");
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_RegCreateKeyTransactedW(
+    u64 hkey, const u16* subkey, u32 reserved, void* cls, u32 options, u32 sam,
+    void* sa, void** out, u32* disposition, void* tx, void* ext) {
+  (void)sa; (void)tx; (void)ext;
+  return trt_RegCreateKeyExW(hkey, subkey, reserved, cls, options, sam, out,
+                             disposition);
+}
+
 int TRT_GUEST_ABI trt_InitializeSecurityDescriptor(void* sd, u32 revision) {
   (void)sd; (void)revision;
   trt_core_log("advapi32: InitializeSecurityDescriptor -> FALSE (no security model)");
@@ -1564,11 +1590,155 @@ int TRT_GUEST_ABI trt_SetSecurityDescriptorDacl(void* sd, int dacl_present,
   return 0;
 }
 
+static thread_local bool t_thread_impersonating = false;
+
+static void* alloc_dup_token_slot() {
+  for (int i = 0; i < 8; ++i) {
+    if (!g_token_used[i]) {
+      g_token_used[i] = true;
+      return (void*)(uintptr_t)(TOKEN_HANDLE_TAG | (u32)(i + 1));
+    }
+  }
+  return nullptr;
+}
+
+int TRT_GUEST_ABI trt_OpenThreadToken(void* thread, u32 desired, int open_as_self,
+                                      void** token_out) {
+  (void)thread; (void)open_as_self;
+  if (!token_out) { token_set_last_error(87); return 0; }
+  *token_out = nullptr;
+  if (!t_thread_impersonating) {
+    token_set_last_error(1008);  // ERROR_NO_TOKEN
+    return 0;
+  }
+  return trt_OpenProcessToken(nullptr, desired, token_out) != nullptr ? 1 : 0;
+}
+
+int TRT_GUEST_ABI trt_DuplicateToken(void* existing_token, int imp_level,
+                                     void** dup_out) {
+  (void)imp_level;
+  if (!dup_out) { token_set_last_error(87); return 0; }
+  *dup_out = nullptr;
+  if (!token_is_valid((u32)(uintptr_t)existing_token)) {
+    token_set_last_error(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  void* nt = alloc_dup_token_slot();
+  if (!nt) { token_set_last_error(5); return 0; }
+  *dup_out = nt;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_ImpersonateLoggedOnUser(void* token) {
+  if (!token_is_valid((u32)(uintptr_t)token)) {
+    token_set_last_error(6);
+    return 0;
+  }
+  t_thread_impersonating = true;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_RevertToSelf(void) {
+  t_thread_impersonating = false;
+  return 1;
+}
+
+static u32 sid_byte_len(const u8* sid) {
+  if (!sid) return 0;
+  return 8u + (u32)sid[1] * 4u;
+}
+
+int TRT_GUEST_ABI trt_CopySid(u32 dest_len, void* dest, const void* src) {
+  if (!dest || !src) { token_set_last_error(87); return 0; }
+  const u32 need = sid_byte_len((const u8*)src);
+  if (dest_len < need || need < 8 || need > 68) {
+    token_set_last_error(122);  // ERROR_INSUFFICIENT_BUFFER
+    return 0;
+  }
+  memcpy(dest, src, need);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_LookupAccountSidW(const u16* sys, const void* sid,
+                                        u16* name, u32* cch_name,
+                                        u16* domain, u32* cch_domain,
+                                        u32* use) {
+  (void)sys; (void)sid;
+  static const u16 k_user[] = {'P','l','a','y','e','r',0};
+  static const u16 k_dom[] = {'X','B','O','X',0};
+  const u32 nu = 6, nd = 4;
+  if (!cch_name || !cch_domain) { token_set_last_error(87); return 0; }
+  if (!name || !domain || *cch_name <= nu || *cch_domain <= nd) {
+    *cch_name = nu + 1;
+    *cch_domain = nd + 1;
+    token_set_last_error(122);  // ERROR_INSUFFICIENT_BUFFER
+    return 0;
+  }
+  memcpy(name, k_user, sizeof(k_user));
+  memcpy(domain, k_dom, sizeof(k_dom));
+  *cch_name = nu;
+  *cch_domain = nd;
+  if (use) *use = 1;  // SidTypeUser
+  return 1;
+}
+
+u32 TRT_GUEST_ABI trt_GetNamedSecurityInfoW(
+    const u16* name, u32 obj_type, u32 sec_info, void** owner, void** group,
+    void** dacl, void** sacl, void** sd) {
+  (void)name; (void)obj_type; (void)sec_info;
+  if (owner) *owner = nullptr;
+  if (group) *group = nullptr;
+  if (dacl) *dacl = nullptr;
+  if (sacl) *sacl = nullptr;
+  if (sd) *sd = nullptr;
+  return 50u;  // ERROR_NOT_SUPPORTED (no host ACL security model on console)
+}
+
+u32 TRT_GUEST_ABI trt_SetNamedSecurityInfoW(
+    const u16* name, u32 obj_type, u32 sec_info, void* owner, void* group,
+    void* dacl, void* sacl) {
+  (void)name; (void)obj_type; (void)sec_info;
+  (void)owner; (void)group; (void)dacl; (void)sacl;
+  return 50u;  // ERROR_NOT_SUPPORTED
+}
+
+u32 TRT_GUEST_ABI trt_SetEntriesInAclW(u32 count, const void* entries,
+                                       void* old_acl, void** new_acl) {
+  (void)count; (void)entries; (void)old_acl;
+  if (new_acl) *new_acl = nullptr;
+  return 50u;  // ERROR_NOT_SUPPORTED
+}
+
+void TRT_GUEST_ABI trt_BuildTrusteeWithSidW(void* trustee, void* sid) {
+  if (!trustee) return;
+  memset(trustee, 0, 32);  // sizeof(TRUSTEE_W) on x64
+  *(void**)((u8*)trustee + 24) = sid;  // ptstrName = sid
+}
+
+u32 TRT_GUEST_ABI trt_GetEffectiveRightsFromAclW(void* acl, const void* trustee,
+                                                 u32* access_rights) {
+  (void)acl; (void)trustee;
+  if (access_rights) *access_rights = 0x001F01FFu;  // FILE_ALL_ACCESS
+  return 0;  // ERROR_SUCCESS
+}
+
+int TRT_GUEST_ABI trt_CreateProcessWithLogonW(
+    const u16* user, const u16* domain, const u16* password, u32 logon_flags,
+    const u16* app, u16* cmdline, u32 flags, void* env, const u16* cur_dir,
+    const void* startup, void* proc_info) {
+  (void)user; (void)domain; (void)password; (void)logon_flags;
+  (void)app; (void)cmdline; (void)flags; (void)env; (void)cur_dir; (void)startup;
+  if (proc_info) memset(proc_info, 0, 24);
+  token_set_last_error(5);  // ERROR_ACCESS_DENIED (AppContainer blocks child spawn)
+  return 0;
+}
+
 int trt_bridge_register_registry(void) {
   static const trt_named_fn k_advapi32_fns[] = {
       {"RegOpenKeyExW", (void*)&trt_RegOpenKeyExW},
       {"RegOpenKeyExA", (void*)&trt_RegOpenKeyExA},
       {"RegCreateKeyExW", (void*)&trt_RegCreateKeyExW},
+      {"RegCreateKeyTransactedW", (void*)&trt_RegCreateKeyTransactedW},
       {"RegCreateKeyW", (void*)&trt_RegCreateKeyW},
       {"RegOpenKeyW", (void*)&trt_RegOpenKeyW},
       {"RegOpenKeyA", (void*)&trt_RegOpenKeyA},
@@ -1600,8 +1770,10 @@ int trt_bridge_register_registry(void) {
       // Event log + security descriptor (Sekiro audit: no event log and
       // no security model on the console -- fail-visible stubs above)
       {"RegisterEventSourceW", (void*)&trt_RegisterEventSourceW},
+      {"RegisterEventSourceA", (void*)&trt_RegisterEventSourceA},
       {"DeregisterEventSource", (void*)&trt_DeregisterEventSource},
       {"ReportEventW", (void*)&trt_ReportEventW},
+      {"ReportEventA", (void*)&trt_ReportEventA},
       {"InitializeSecurityDescriptor", (void*)&trt_InitializeSecurityDescriptor},
       {"SetSecurityDescriptorDacl", (void*)&trt_SetSecurityDescriptorDacl},
       // CryptoAPI + RtlGenRandom
@@ -1655,6 +1827,18 @@ int trt_bridge_register_registry(void) {
       {"AllocateAndInitializeSid", (void*)&trt_AllocateAndInitializeSid},
       {"FreeSid", (void*)&trt_FreeSid},
       {"CheckTokenMembership", (void*)&trt_CheckTokenMembership},
+      {"OpenThreadToken", (void*)&trt_OpenThreadToken},
+      {"DuplicateToken", (void*)&trt_DuplicateToken},
+      {"ImpersonateLoggedOnUser", (void*)&trt_ImpersonateLoggedOnUser},
+      {"RevertToSelf", (void*)&trt_RevertToSelf},
+      {"LookupAccountSidW", (void*)&trt_LookupAccountSidW},
+      {"CopySid", (void*)&trt_CopySid},
+      {"GetNamedSecurityInfoW", (void*)&trt_GetNamedSecurityInfoW},
+      {"SetNamedSecurityInfoW", (void*)&trt_SetNamedSecurityInfoW},
+      {"SetEntriesInAclW", (void*)&trt_SetEntriesInAclW},
+      {"BuildTrusteeWithSidW", (void*)&trt_BuildTrusteeWithSidW},
+      {"GetEffectiveRightsFromAclW", (void*)&trt_GetEffectiveRightsFromAclW},
+      {"CreateProcessWithLogonW", (void*)&trt_CreateProcessWithLogonW},
   };
   const int n_adv = (int)(sizeof(k_advapi32_fns) / sizeof(k_advapi32_fns[0]));
   trt_module_register("advapi32.dll", TRT_ROUTE_BUILTIN, k_advapi32_fns, n_adv);

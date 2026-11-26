@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 int trt_bridge_register_msvcrt(void);
+int trt_bridge_register_vcruntime_fallback(void);
 
 #ifdef __cplusplus
 }
