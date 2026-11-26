@@ -771,6 +771,64 @@ extern "C" unsigned long long trt_timer_fires(void) {
   return g_timer_fires.load();
 }
 
+namespace {
+const char* midi_error_text(u32 error) {
+  switch (error) {
+    case 0: return "No error.";
+    case 1: return "Unspecified multimedia error.";
+    case 2: return "Invalid device ID.";
+    case 3: return "Device driver is disabled.";
+    case 4: return "Device already allocated.";
+    case 5: return "Invalid device handle.";
+    case 6: return "No device driver.";
+    case 7: return "Not enough memory.";
+    case 8: return "Function is not supported.";
+    case 9: return "Error number is out of range.";
+    case 10: return "Invalid flag.";
+    case 11: return "Invalid parameter.";
+    case 12: return "Device handle is busy.";
+    case 13: return "Device alias was not found.";
+    case 14: return "Invalid multimedia registry database.";
+    case 15: return "Registry key was not found.";
+    case 16: return "Registry read failed.";
+    case 17: return "Registry write failed.";
+    case 18: return "Registry deletion failed.";
+    case 19: return "Registry value was not found.";
+    case 20: return "Device driver did not call DriverCallback.";
+    case 21: return "More data is available.";
+    case 64: return "MIDI header is not prepared.";
+    case 65: return "MIDI playback is still in progress.";
+    case 66: return "No MIDI instruments are configured.";
+    case 67: return "MIDI device is busy.";
+    case 68: return "MIDI port is disconnected.";
+    case 69: return "Invalid MIDI setup.";
+    case 70: return "Operation is unsupported in the current MIDI open mode.";
+    case 71: return "MIDI Thru device consumed the message.";
+    default: return nullptr;
+  }
+}
+}
+
+u32 TRT_GUEST_ABI trt_midiOutGetErrorTextA(u32 error, char* buf, u32 len) {
+  if (!len) return 0;
+  if (!buf) return 11;
+  const char* text = midi_error_text(error);
+  if (!text) return 9;  // MMSYSERR_BADERRNUM
+  snprintf(buf, len, "%s", text);
+  return 0;
+}
+
+u32 TRT_GUEST_ABI trt_midiOutGetErrorTextW(u32 error, u16* buf, u32 len) {
+  if (!len) return 0;
+  if (!buf) return 11;
+  const char* text = midi_error_text(error);
+  if (!text) return 9;  // MMSYSERR_BADERRNUM
+  u32 i = 0;
+  for (; i < len - 1 && text[i]; ++i) buf[i] = static_cast<u16>(text[i]);
+  buf[i] = 0;
+  return 0;
+}
+
 int trt_bridge_register_winmm(void) {
   static const trt_named_fn k_fns[] = {
       {"timeGetTime", (void*)&trt_timeGetTime},
@@ -819,6 +877,8 @@ int trt_bridge_register_winmm(void) {
       {"midiOutReset", (void*)&trt_midiOutReset},
       {"midiOutGetDevCapsW", (void*)&trt_midiOutGetDevCapsW},
       {"midiOutGetDevCapsA", (void*)&trt_midiOutGetDevCapsA},
+      {"midiOutGetErrorTextA", (void*)&trt_midiOutGetErrorTextA},
+      {"midiOutGetErrorTextW", (void*)&trt_midiOutGetErrorTextW},
       {"midiOutGetVolume", (void*)&trt_midiOutGetVolume},
       {"midiOutSetVolume", (void*)&trt_midiOutSetVolume},
       // Real now: a thread per timer fires the guest callback (or sets the
