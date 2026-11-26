@@ -35,7 +35,13 @@ void* TRT_STDCALL trt_MapViewOfFile(void*, u32, u32, u32, u64);
 int TRT_STDCALL trt_UnmapViewOfFile(void*);
 u64 TRT_STDCALL trt_CreateThread(void*, void*, void*, void*, u32, u32*);
 u32 TRT_STDCALL trt_WaitForSingleObject(u64, u32);
+u32 TRT_STDCALL trt_WaitForMultipleObjects(u32, const u64*, bool, u32);
+int TRT_STDCALL trt_ReleaseMutex(u64);
 void* TRT_STDCALL trt_CreateEventW(void*, u32, u32, const u16*);
+u64 TRT_STDCALL trt_CreateEventA(void*, bool, bool, const char*);
+u64 TRT_STDCALL trt_CreateMutexA(void*, bool, const char*);
+u64 TRT_STDCALL trt_CreateSemaphoreA(void*, u32, u32, const char*);
+
 int TRT_STDCALL trt_SetEvent(u64);
 int TRT_STDCALL trt_ResetEvent(u64);
 int TRT_STDCALL trt_InitializeCriticalSection(void*);
@@ -365,6 +371,82 @@ int main(int argc, char** argv) {
     CHECK(stats.wait_completed == 1 && stats.wait_timed_out == 1 &&
               stats.wait_failed == 1 && stats.event_failed == 1 && stats.event_signaled == 1,
           "synchronization diagnostics distinguish outcomes");
+  }
+
+  {
+    const char* name = "test-shared-synchronization-namespace";
+    const u64 event = trt_CreateEventA(nullptr, true, true, name);
+    CHECK(event && trt_GetLastError() == 0, "create a named event");
+    const u64 reopened = trt_CreateEventA(nullptr, false, false, name);
+    CHECK(reopened == event && trt_GetLastError() == 183,
+          "reopening a named event preserves its identity");
+    CHECK(trt_WaitForSingleObject(reopened, 0) == 0 &&
+              trt_WaitForSingleObject(reopened, 0) == 0,
+          "same-type reopening preserves the original manual reset state");
+    const u64 conflicting_mutex = trt_CreateMutexA(nullptr, false, name);
+    CHECK(!conflicting_mutex && trt_GetLastError() == 6,
+          "a named mutex cannot shadow an existing event");
+    if (conflicting_mutex) trt_CloseHandle(reinterpret_cast<void*>(conflicting_mutex));
+    trt_CloseHandle(reinterpret_cast<void*>(event));
+    const u64 conflicting_sem = trt_CreateSemaphoreA(nullptr, 0, 1, name);
+    CHECK(!conflicting_sem && trt_GetLastError() == 6,
+          "a named semaphore cannot shadow a still-referenced event");
+    if (conflicting_sem) trt_CloseHandle(reinterpret_cast<void*>(conflicting_sem));
+    trt_CloseHandle(reinterpret_cast<void*>(reopened));
+    const u64 semaphore = trt_CreateSemaphoreA(nullptr, 1, 1, name);
+    CHECK(semaphore && trt_GetLastError() == 0,
+          "the name becomes available after the last reference closes");
+    trt_CloseHandle(reinterpret_cast<void*>(semaphore));
+    const u64 invalid = trt_CreateSemaphoreA(nullptr, 2, 1, nullptr);
+    CHECK(!invalid && trt_GetLastError() == 87,
+          "a semaphore rejects an initial value over its maximum");
+    if (invalid) trt_CloseHandle(reinterpret_cast<void*>(invalid));
+  }
+
+  {
+    struct MutexOwner {
+      static u64 TRT_STDCALL run(u64 mutex) {
+        return trt_WaitForSingleObject(mutex, 0) |
+               trt_WaitForSingleObject(mutex, 0);
+      }
+    };
+    auto abandon = [&](u64 mutex) {
+      const u64 worker = trt_CreateThread(nullptr, nullptr, (void*)&MutexOwner::run,
+                                         (void*)(uintptr_t)mutex, 0, nullptr);
+      CHECK(worker && trt_WaitForSingleObject(worker, 2000) == 0,
+            "mutex owner thread exits");
+      if (worker) trt_CloseHandle(reinterpret_cast<void*>(worker));
+    };
+    constexpr u32 wait_abandoned = 0x80u;
+    constexpr u32 wait_timeout = 0x102u;
+    const u64 mutex = trt_CreateMutexA(nullptr, false, nullptr);
+    const u64 event = trt_CreateEventA(nullptr, false, false, nullptr);
+    CHECK(mutex && event, "create mutex and event for abandoned-wait test");
+    if (mutex && event) {
+      abandon(mutex);
+      CHECK(trt_WaitForSingleObject(mutex, 0) == wait_abandoned,
+            "a dead owner abandons all recursive mutex acquisitions");
+      CHECK(trt_ReleaseMutex(mutex) && trt_WaitForSingleObject(mutex, 0) == 0,
+            "the waiter acquires the abandoned mutex and clears its abandoned state");
+      trt_ReleaseMutex(mutex);
+
+      abandon(mutex);
+      const u64 handles[] = {event, mutex};
+      CHECK(trt_WaitForMultipleObjects(2, handles, false, 0) == wait_abandoned + 1,
+            "wait-any returns the abandoned mutex index");
+      trt_ReleaseMutex(mutex);
+
+      abandon(mutex);
+      CHECK(trt_WaitForMultipleObjects(2, handles, true, 5) == wait_timeout,
+            "wait-all leaves an abandoned mutex pending while another handle is unsignaled");
+      CHECK(trt_SetEvent(event) &&
+                trt_WaitForMultipleObjects(2, handles, true, 0) == wait_abandoned + 1,
+            "wait-all reports abandonment once all handles are ready");
+      CHECK(trt_ReleaseMutex(mutex) && trt_WaitForSingleObject(event, 0) == wait_timeout,
+            "wait-all acquires the mutex and consumes the auto-reset event");
+    }
+    if (event) trt_CloseHandle(reinterpret_cast<void*>(event));
+    if (mutex) trt_CloseHandle(reinterpret_cast<void*>(mutex));
   }
 
   CHECK(ret & 0x200u, "focus lifecycle (SetFocus/GetFocus)");

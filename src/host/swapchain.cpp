@@ -41,7 +41,8 @@ winrt::com_ptr<ID3D11DeviceContext1> g_ctx;
 winrt::com_ptr<IDXGISwapChain1> g_swap;
 winrt::com_ptr<IDXGISwapChain3> g_swap3;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
-winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer;
+winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer, g_guest_resolved;
+DXGI_FORMAT g_guest_resolve_format = DXGI_FORMAT_UNKNOWN;
 winrt::com_ptr<ID3D11Query> g_guest_draw_query;
 bool g_guest_draw_query_active = false;
 bool g_guest_draw_query_pending = false;
@@ -333,10 +334,13 @@ void release_guest_backbuffer() {
     trt_esram_release_surface(desc.Width, desc.Height, desc.Format);
   }
   g_guest_backbuffer = nullptr;
+  g_guest_resolved = nullptr;
+  g_guest_resolve_format = DXGI_FORMAT_UNKNOWN;
 }
 
 int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
-                                          u32 buffer_count, u32 swap_effect) {
+                                          u32 buffer_count, u32 swap_effect,
+                                          u32 sample_count, u32 sample_quality) {
   if (!g_swap || !g_device || !width || !height) return E_INVALIDARG;
   if (!trt_gpu_d3d11_uses_stable_backbuffer(buffer_count, swap_effect)) {
     const HRESULT hr = resize_d3d11_backbuffers(width, height, format);
@@ -353,11 +357,14 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
                     format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
   const auto native_format = format == DXGI_FORMAT_UNKNOWN ? desc.Format : sanitize_flip_fmt(format);
   DXGI_FORMAT guest_format = srgb ? static_cast<DXGI_FORMAT>(format) : native_format;
+  if (sample_count > 1 && format && !srgb && native_format != format)
+    return DXGI_ERROR_UNSUPPORTED;
   if (g_guest_backbuffer) {
     D3D11_TEXTURE2D_DESC current{};
     g_guest_backbuffer->GetDesc(&current);
     if (format == DXGI_FORMAT_UNKNOWN) guest_format = current.Format;
-    if (current.Width == width && current.Height == height && current.Format == guest_format)
+    if (current.Width == width && current.Height == height && current.Format == guest_format &&
+        current.SampleDesc.Count == sample_count && current.SampleDesc.Quality == sample_quality)
       return resize_d3d11_backbuffers(width, height, format);
   }
   D3D11_TEXTURE2D_DESC texture{};
@@ -366,11 +373,27 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
   texture.MipLevels = 1;
   texture.ArraySize = 1;
   texture.Format = guest_format;
-  texture.SampleDesc.Count = 1;
+  texture.SampleDesc = {sample_count, sample_quality};
   texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
   winrt::com_ptr<ID3D11Texture2D> target;
   const HRESULT created = g_device->CreateTexture2D(&texture, nullptr, target.put());
   if (FAILED(created)) return created;
+  winrt::com_ptr<ID3D11Texture2D> resolved;
+  if (sample_count > 1) {
+    UINT support = 0;
+    const HRESULT queried = g_device->CheckFormatSupport(guest_format, &support);
+    if (FAILED(queried)) return queried;
+    if (!(support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE))
+      return DXGI_ERROR_UNSUPPORTED;
+    // Resolve into the typed guest format first. For sRGB, CopyResource can
+    // then transfer the bits to the corresponding UNORM CoreWindow texture.
+    auto resolve_desc = texture;
+    resolve_desc.SampleDesc = {1, 0};
+    resolve_desc.BindFlags = 0;
+    const HRESULT resolve_created =
+        g_device->CreateTexture2D(&resolve_desc, nullptr, resolved.put());
+    if (FAILED(resolve_created)) return resolve_created;
+  }
   const HRESULT resized = resize_d3d11_backbuffers(width, height, format);
   if (FAILED(resized)) return resized;
   release_guest_backbuffer();
@@ -378,7 +401,10 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 width, u32 height, u32 format,
     trt_esram_qualify_and_alloc(texture.Width, texture.Height, texture.Format, texture.BindFlags, "CoreWindow_backbuffer");
   }
   g_guest_backbuffer = std::move(target);
-  log_line("d3d: using a stable guest backbuffer over the CoreWindow flip chain");
+  g_guest_resolved = std::move(resolved);
+  if (g_guest_resolved) g_guest_resolve_format = guest_format;
+  log_line(g_guest_resolved ? "d3d: resolving a multisampled guest backbuffer at Present"
+                           : "d3d: using a stable guest backbuffer over the CoreWindow flip chain");
   return S_OK;
 }
 
@@ -663,7 +689,7 @@ void measure_surface_pair(ID3D11Texture2D* guest, ID3D11Texture2D* host) {
   if (view) {
     winrt::com_ptr<ID3D11Resource> resource;
     view->GetResource(resource.put());
-    if (resource.get() == static_cast<ID3D11Resource*>(guest)) {
+    if (resource.get() == static_cast<ID3D11Resource*>(g_guest_backbuffer.get())) {
       g_surface_guest_rtv.fetch_add(1);
     } else {
       g_surface_other_rtv.fetch_add(1);
@@ -678,8 +704,14 @@ void TRT_GUEST_ABI prepare_d3d11_present() {
   if (g_guest_backbuffer) {
     winrt::com_ptr<ID3D11Texture2D> back;
     if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
-      g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
-      measure_surface_pair(g_guest_backbuffer.get(), back.get());
+      auto* present_source = g_guest_backbuffer.get();
+      if (g_guest_resolved) {
+        g_ctx->ResolveSubresource(g_guest_resolved.get(), 0, present_source, 0,
+                                  g_guest_resolve_format);
+        present_source = g_guest_resolved.get();
+      }
+      g_ctx->CopyResource(back.get(), present_source);
+      measure_surface_pair(present_source, back.get());
     }
   }
   draw_guest_pointer();
@@ -778,9 +810,14 @@ HRESULT create_d3d11_corewindow_swapchain() {
   g_backbuffer_height = sc.Height;
   g_swap3 = g_swap.try_as<IDXGISwapChain3>();
   winrt::com_ptr<ID3D11Texture2D> back;
-  g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void());
-  if (back) g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
-  return S_OK;
+  HRESULT buffer_hr = g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void());
+  if (SUCCEEDED(buffer_hr))
+    buffer_hr = g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+  if (FAILED(buffer_hr)) {
+    g_swap3 = nullptr;
+    g_swap = nullptr;
+  }
+  return buffer_hr;
 }
 } // namespace
 
@@ -859,7 +896,7 @@ bool guest_cursor_overlay_ready(uint64_t now) {
 void set_guest_cursor_visible(bool visible) { g_guest_cursor_visible.store(visible); }
 
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
-  swapchain_result r{};
+  swapchain_result r{E_FAIL, E_FAIL, 0, 0, 0};
   auto bounds = w.Bounds();
   // Settings knob: resolution_scale (%) renders below native size and lets
   // DXGI scale up — the main GPU headroom lever on Series S-class targets.
@@ -904,15 +941,29 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   D3D_FEATURE_LEVEL achieved{};
   winrt::com_ptr<ID3D11Device> dev;
   winrt::com_ptr<ID3D11DeviceContext> ctx;
-  r.device_hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                  flags, levels, (UINT)level_count,
-                                  D3D11_SDK_VERSION, dev.put(), &achieved,
-                                  ctx.put());
+  const auto create_device = [&](const D3D_FEATURE_LEVEL* requested, UINT count) {
+    dev = nullptr;
+    ctx = nullptr;
+    return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                             flags, requested, count, D3D11_SDK_VERSION,
+                             dev.put(), &achieved, ctx.put());
+  };
+  r.device_hr = create_device(levels, static_cast<UINT>(level_count));
+  if (retry_d3d11_without_11_1(r.device_hr, level_values[0], level_count)) {
+    log_line("graphics: retrying D3D11 with feature levels 11_0 and lower");
+    r.device_hr = create_device(levels + 1, static_cast<UINT>(level_count - 1));
+  }
   if (FAILED(r.device_hr)) return r;
   g_fl = (unsigned)achieved;
   r.feature_level = g_fl;
-  g_device = dev.as<ID3D11Device1>();
-  g_ctx = ctx.as<ID3D11DeviceContext1>();
+  g_device = dev.try_as<ID3D11Device1>();
+  g_ctx = ctx.try_as<ID3D11DeviceContext1>();
+  if (!g_device || !g_ctx) {
+    g_device = nullptr;
+    g_ctx = nullptr;
+    r.device_hr = E_NOINTERFACE;
+    return r;
+  }
   // Video-memory baseline at boot: is the 3.8GB video usage seen in
   // TEX-OOM-DIAG (ultrapool) a driver/system reservation, or game-
   // allocated? Logged once at device creation, before any game runs.
@@ -974,12 +1025,17 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
     }
   }
 
-  winrt::com_ptr<IDXGIDevice1> dxgi_dev;
-  g_device.as(dxgi_dev);
+  auto dxgi_dev = g_device.try_as<IDXGIDevice1>();
+  if (!dxgi_dev) {
+    r.sc_hr = E_NOINTERFACE;
+    return r;
+  }
   winrt::com_ptr<IDXGIAdapter> adapter;
-  dxgi_dev->GetAdapter(adapter.put());
-  adapter->GetParent(__uuidof(IDXGIFactory2), g_factory.put_void());
-  if (g_factory) g_factory6 = g_factory.try_as<IDXGIFactory6>();
+  r.sc_hr = dxgi_dev->GetAdapter(adapter.put());
+  if (FAILED(r.sc_hr)) return r;
+  r.sc_hr = adapter->GetParent(__uuidof(IDXGIFactory2), g_factory.put_void());
+  if (FAILED(r.sc_hr)) return r;
+  g_factory6 = g_factory.try_as<IDXGIFactory6>();
 
   r.sc_hr = create_d3d11_corewindow_swapchain();
   if (FAILED(r.sc_hr)) return r;
@@ -1010,6 +1066,7 @@ void swapchain_restore_d3d11() {
 }
 
 void swapchain_restore_launcher_format() {
+  if (!g_swap) return;
   release_guest_backbuffer();
   const HRESULT hr = resize_d3d11_backbuffers(g_w, g_h, DXGI_FORMAT_B8G8R8A8_UNORM);
   if (FAILED(hr)) log_line("d3d: could not restore launcher backbuffers");
@@ -1111,6 +1168,8 @@ void swapchain_shutdown() {
   g_d3d12_swap = nullptr;
   g_d3d12_device = nullptr;
   g_guest_backbuffer = nullptr;
+  g_guest_resolved = nullptr;
+  g_guest_resolve_format = DXGI_FORMAT_UNKNOWN;
   g_rtv = nullptr;
   g_swap3 = nullptr;
   g_swap = nullptr;

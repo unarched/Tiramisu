@@ -2450,6 +2450,7 @@ void handle_client(sock_t s) {
              "\"d3d11_get_buffer_calls\":%u,\"d3d11_present_calls\":%u,"
              "\"d3d11_successful_presents\":%u,\"d3d11_last_present_result\":%d,"
              "\"d3d11_swap_effect\":%u,\"d3d11_buffer_count\":%u,\"d3d11_stable_backbuffer\":%u,"
+             "\"d3d11_sample_count\":%u,\"d3d11_sample_quality\":%u,"
              "\"d3d11_width\":%u,\"d3d11_height\":%u,"
              "\"d3d11_resize_target_calls\":%u,\"d3d11_resize_target_width\":%u,"
              "\"d3d11_resize_target_height\":%u,\"d3d11_resize_target_result\":%d,"
@@ -2475,7 +2476,8 @@ void handle_client(sock_t s) {
              stats.d3d11_device_calls, stats.d3d11_swapchains, stats.d3d11_get_buffer_calls,
              stats.d3d11_present_calls, stats.d3d11_successful_presents,
              stats.d3d11_last_present_result, stats.d3d11_swap_effect,
-             stats.d3d11_buffer_count, stats.d3d11_stable_backbuffer, stats.d3d11_width,
+             stats.d3d11_buffer_count, stats.d3d11_stable_backbuffer,
+             stats.d3d11_sample_count, stats.d3d11_sample_quality, stats.d3d11_width,
              stats.d3d11_height, resize.target_calls, resize.target_width, resize.target_height,
              resize.target_result, resize.buffer_calls, resize.buffer_requested_width,
              resize.buffer_requested_height, resize.buffer_client_width,

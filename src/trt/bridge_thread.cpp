@@ -137,6 +137,7 @@ struct sync_object {
   u32 handle_refs = 0;
   bool signalled = false;
   bool manual_reset = false;
+  bool abandoned = false;
   int lock_count = 0;
   int max_count = 0x7FFFFFFF;
   u32 owner_tid = 0;
@@ -191,6 +192,7 @@ struct sync_object {
     handle_refs = 0;
     signalled = false;
     manual_reset = false;
+    abandoned = false;
     lock_count = 0;
     max_count = 0x7FFFFFFF;
     owner_tid = 0;
@@ -2098,16 +2100,46 @@ bool is_object_ready_locked(sync_object* o, u32 my_tid) {
   }
 }
 
-void consume_object_wait_locked(sync_object* o, u32 my_tid) {
-  if (!o) return;
-  if (o->kind == OBJ_EVENT && !o->manual_reset) {
-    o->signalled = false;
-  } else if (o->kind == OBJ_MUTEX) {
-    ++o->lock_count;
-    o->owner_tid = my_tid;
-  } else if (o->kind == OBJ_SEMAPHORE && o->lock_count > 0) {
-    --o->lock_count;
+constexpr u32 k_wait_abandoned = 0x80u;
+
+bool consume_object_wait_locked(sync_object& o, u32 my_tid) {
+  if (o.kind == OBJ_EVENT && !o.manual_reset) {
+    o.signalled = false;
+  } else if (o.kind == OBJ_MUTEX) {
+    ++o.lock_count;
+    o.owner_tid = my_tid;
+    const bool abandoned = o.abandoned;
+    o.abandoned = false;
+    return abandoned;
+  } else if (o.kind == OBJ_SEMAPHORE && o.lock_count > 0) {
+    --o.lock_count;
   }
+  return false;
+}
+
+u32 consume_ready_objects_locked(const u64* handles, u32 first, u32 end,
+                                 u32 tid, u32 success_code) {
+  u32 result = success_code;
+  for (u32 i = first; i < end; ++i) {
+    if (consume_object_wait_locked(*object_for_locked(handles[i]), tid) &&
+        result < k_wait_abandoned) {
+      result = k_wait_abandoned + i;
+    }
+  }
+  return result;
+}
+
+void abandon_owned_mutexes_locked(u32 tid) {
+  bool released = false;
+  for (sync_object& object : g_objects) {
+    if (object.kind != OBJ_MUTEX || object.owner_tid != tid || !object.lock_count)
+      continue;
+    object.owner_tid = 0;
+    object.lock_count = 0;
+    object.abandoned = true;
+    released = true;
+  }
+  if (released) g_sync_cv.notify_all();
 }
 
 void notify_thread_exit_once() {
@@ -2118,7 +2150,9 @@ void notify_thread_exit_once() {
   trt_fls_on_thread_exit();
   {
     std::lock_guard<std::mutex> lk(g_obj_mu);
-    g_apc_queues.erase(current_tid());
+    const u32 tid = current_tid();
+    g_apc_queues.erase(tid);
+    abandon_owned_mutexes_locked(tid);
   }
 }
 
@@ -2852,7 +2886,7 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
   }
 #endif
   if (is_object_ready_locked(o, my_tid)) {
-    consume_object_wait_locked(o, my_tid);
+    const bool abandoned = consume_object_wait_locked(*o, my_tid);
     // .222 DIAG: immediate-return wait -- the Sekiro main
     // thread (tid=872) spins on its own auto-reset event
     // here and never reaches the .207 log or the WAIT-PARK
@@ -2917,7 +2951,7 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
         maybe_log_post_wake();
       }
     }
-    return 0;
+    return abandoned ? k_wait_abandoned : 0u;
   }
   if (alertable && drain_apcs_locked(lk, my_tid)) return 0xC0u;
   if (ms == 0) {
@@ -3002,7 +3036,7 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
     }
 #endif
     if (is_object_ready_locked(o, my_tid)) {
-      consume_object_wait_locked(o, my_tid);
+      const bool abandoned = consume_object_wait_locked(*o, my_tid);
       // .221 DIAG: the wait woke -- log who set the event, so a
       // park/wake pair names the partner even when the gap ring
       // only shows the wait side. Same cap shape as WAIT-PARK.
@@ -3022,7 +3056,7 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
         // census can report the worker's fate.
         if (watched_find(handle)) woke_record(my_tid, handle);
       }
-      return 0;
+      return abandoned ? k_wait_abandoned : 0u;
     }
     if (ms != 0xFFFFFFFFu && std::chrono::steady_clock::now() >= deadline) {
       return 0x102u;
@@ -3092,10 +3126,8 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
     if (wait_all ? (signalled == count) : (signalled > 0)) {
       const u32 lo = wait_all ? 0u : first_idx;
       const u32 hi = wait_all ? count : (first_idx + 1u);
-      for (u32 i = lo; i < hi; ++i) {
-        consume_object_wait_locked(object_for_locked(hs[i]), my_tid);
-      }
-      return wait_all ? 0u : first_idx;
+      return consume_ready_objects_locked(hs.data(), lo, hi, my_tid,
+                                          wait_all ? 0u : first_idx);
     }
     if (alertable && drain_apcs_locked(lk, my_tid)) return 0xC0u;
     if (ms == 0) return 0x102u;
@@ -3117,10 +3149,8 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
         if (wait_all ? (fin_sig == count) : (fin_sig > 0)) {
           const u32 lo = wait_all ? 0u : fin_idx;
           const u32 hi = wait_all ? count : (fin_idx + 1u);
-          for (u32 i = lo; i < hi; ++i) {
-            consume_object_wait_locked(object_for_locked(hs[i]), my_tid);
-          }
-          return wait_all ? 0u : fin_idx;
+          return consume_ready_objects_locked(hs.data(), lo, hi, my_tid,
+                                              wait_all ? 0u : fin_idx);
         }
         return 0x102u;
       }
@@ -3128,7 +3158,8 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
   }
 }
 
-// WaitForSingleObject(handle, ms): 0 signalled, 0x102 timeout, 0xFFFFFFFF failed
+// WaitForSingleObject returns 0 on success, 0x80 for an abandoned mutex,
+// 0x102 on timeout, or 0xFFFFFFFF on failure.
 static std::atomic<u32> g_launch_wait_completed{0}, g_launch_wait_timed_out{0};
 static std::atomic<u32> g_launch_wait_failed{0}, g_launch_event_signaled{0};
 static std::atomic<u32> g_launch_event_failed{0};
@@ -4302,23 +4333,36 @@ int TRT_STDCALL trt_GetThreadPriority(u64 thread) {
 }
 
 // --- events ---
+// Windows events, mutexes, and semaphores use the same object namespace.
+// A matching name can reopen the same kind, or fail on a kind conflict.
+static bool reopen_named_sync_object_locked(const std::string& name, obj_kind kind,
+                                            u64* handle) {
+  if (name.empty()) return false;
+  const auto it = g_named_objects.find(name);
+  if (it == g_named_objects.end()) return false;
+  auto* object = object_for_locked(it->second);
+  if (!object) {
+    g_named_objects.erase(it);
+    return false;
+  }
+  *handle = 0;
+  if (object->kind != kind) {
+    trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+    return true;
+  }
+  ++object->handle_refs;
+  *handle = it->second;
+  trt_SetLastError(183);  // ERROR_ALREADY_EXISTS
+  return true;
+}
+
 u64 TRT_STDCALL trt_CreateEventW(void* attrs, bool manual, bool initial,
                                  const u16* name) {
   (void)attrs;
   const std::string key = utf16_to_utf8(name);
   std::lock_guard<std::mutex> lk(g_obj_mu);
-  if (!key.empty()) {
-    auto it = g_named_objects.find("E:" + key);
-    if (it != g_named_objects.end()) {
-      sync_object* existing = object_for_locked(it->second);
-      if (existing && existing->kind == OBJ_EVENT) {
-        ++existing->handle_refs;
-        trt_SetLastError(183);  // ERROR_ALREADY_EXISTS
-        return it->second;
-      }
-      g_named_objects.erase(it);
-    }
-  }
+  u64 existing = 0;
+  if (reopen_named_sync_object_locked(key, OBJ_EVENT, &existing)) return existing;
   const u64 h = alloc_object_locked(OBJ_EVENT);
   if (!h) {
     trt_SetLastError(8);
@@ -4328,7 +4372,7 @@ u64 TRT_STDCALL trt_CreateEventW(void* attrs, bool manual, bool initial,
   o->manual_reset = manual;
   o->signalled = initial;
   if (!key.empty()) {
-    o->name = "E:" + key;
+    o->name = key;
     g_named_objects[o->name] = h;
   }
   {
@@ -4364,14 +4408,14 @@ u64 TRT_STDCALL trt_OpenEventW(u32 access, int inherit, const u16* name) {
     return 0;
   }
   std::lock_guard<std::mutex> lk(g_obj_mu);
-  auto it = g_named_objects.find("E:" + key);
+  auto it = g_named_objects.find(key);
   if (it == g_named_objects.end()) {
     trt_SetLastError(2);  // ERROR_FILE_NOT_FOUND
     return 0;
   }
   sync_object* o = object_for_locked(it->second);
   if (!o || o->kind != OBJ_EVENT) {
-    trt_SetLastError(2);
+    trt_SetLastError(o ? 6 : 2);
     return 0;
   }
   ++o->handle_refs;
@@ -4487,18 +4531,8 @@ u64 TRT_STDCALL trt_CreateMutexW(void* attrs, bool initial_owner,
   const std::string key = utf16_to_utf8(name);
   const u32 my_tid = current_tid();
   std::lock_guard<std::mutex> lk(g_obj_mu);
-  if (!key.empty()) {
-    auto it = g_named_objects.find("M:" + key);
-    if (it != g_named_objects.end()) {
-      sync_object* existing = object_for_locked(it->second);
-      if (existing && existing->kind == OBJ_MUTEX) {
-        ++existing->handle_refs;
-        trt_SetLastError(183);
-        return it->second;
-      }
-      g_named_objects.erase(it);
-    }
-  }
+  u64 existing = 0;
+  if (reopen_named_sync_object_locked(key, OBJ_MUTEX, &existing)) return existing;
   const u64 h = alloc_object_locked(OBJ_MUTEX);
   if (!h) {
     trt_SetLastError(8);
@@ -4508,7 +4542,7 @@ u64 TRT_STDCALL trt_CreateMutexW(void* attrs, bool initial_owner,
   o->lock_count = initial_owner ? 1 : 0;
   o->owner_tid = initial_owner ? my_tid : 0;
   if (!key.empty()) {
-    o->name = "M:" + key;
+    o->name = key;
     g_named_objects[o->name] = h;
   }
   {
@@ -4542,14 +4576,14 @@ u64 TRT_STDCALL trt_OpenMutexW(u32 access, int inherit, const u16* name) {
   const std::string key = utf16_to_utf8(name);
   if (key.empty()) { trt_SetLastError(87); return 0; }
   std::lock_guard<std::mutex> lk(g_obj_mu);
-  auto it = g_named_objects.find("M:" + key);
+  auto it = g_named_objects.find(key);
   if (it == g_named_objects.end()) {
     trt_SetLastError(2);
     return 0;
   }
   sync_object* o = object_for_locked(it->second);
   if (!o || o->kind != OBJ_MUTEX) {
-    trt_SetLastError(2);
+    trt_SetLastError(o ? 6 : 2);
     return 0;
   }
   ++o->handle_refs;
@@ -4649,17 +4683,13 @@ u64 TRT_STDCALL trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
   (void)attrs;
   const std::string key = utf16_to_utf8(name);
   std::lock_guard<std::mutex> lk(g_obj_mu);
-  if (!key.empty()) {
-    auto it = g_named_objects.find("S:" + key);
-    if (it != g_named_objects.end()) {
-      sync_object* existing = object_for_locked(it->second);
-      if (existing && existing->kind == OBJ_SEMAPHORE) {
-        ++existing->handle_refs;
-        trt_SetLastError(183);
-        return it->second;
-      }
-      g_named_objects.erase(it);
-    }
+  u64 existing = 0;
+  if (reopen_named_sync_object_locked(key, OBJ_SEMAPHORE, &existing)) return existing;
+  // Counts are signed LONG values in Win32. Reject negative or
+  // impossible counts before narrowing them into the sync object.
+  if (!maximum || maximum > 0x7FFFFFFFu || initial > maximum) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
   }
   const u64 h = alloc_object_locked(OBJ_SEMAPHORE);
   if (!h) {
@@ -4670,7 +4700,7 @@ u64 TRT_STDCALL trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
   o->lock_count = (int)initial;
   o->max_count = (int)maximum;
   if (!key.empty()) {
-    o->name = "S:" + key;
+    o->name = key;
     g_named_objects[o->name] = h;
   }
   // .238 DIAG: name the creator of every bridged semaphore --
@@ -4716,14 +4746,14 @@ u64 TRT_STDCALL trt_OpenSemaphoreW(u32 access, int inherit, const u16* name) {
   const std::string key = utf16_to_utf8(name);
   if (key.empty()) { trt_SetLastError(87); return 0; }
   std::lock_guard<std::mutex> lk(g_obj_mu);
-  auto it = g_named_objects.find("S:" + key);
+  auto it = g_named_objects.find(key);
   if (it == g_named_objects.end()) {
     trt_SetLastError(2);
     return 0;
   }
   sync_object* o = object_for_locked(it->second);
   if (!o || o->kind != OBJ_SEMAPHORE) {
-    trt_SetLastError(2);
+    trt_SetLastError(o ? 6 : 2);
     return 0;
   }
   ++o->handle_refs;

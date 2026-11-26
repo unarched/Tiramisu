@@ -2919,16 +2919,20 @@ bool k32_try_exact_or_dll(const char* base_path, bool allow_dll_ext,
   return false;
 }
 
+const char* module_path_without_device_prefix(const char* p) {
+  if (((p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') &&
+       (p[2] == '?' || p[2] == '.') && (p[3] == '\\' || p[3] == '/')) ||
+      (p[0] == '\\' && p[1] == '?' && p[2] == '?' && p[3] == '\\')) {
+    return p + 4;
+  }
+  return p;
+}
+
 // "C:\\dir\\engine.dll" / "engine.dll" / "engine" -> an existing host path
 bool guest_path_to_host(const u16* guest_path, char* out, size_t cap) {
   char utf8[1024];
   if (trt_utf16_to_utf8(guest_path, utf8, sizeof(utf8)) != 0) return false;
-  const char* p = utf8;
-  if (((p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') &&
-       (p[2] == '?' || p[2] == '.') && (p[3] == '\\' || p[3] == '/')) ||
-      (p[0] == '\\' && p[1] == '?' && p[2] == '?' && p[3] == '\\')) {
-    p += 4;
-  }
+  const char* p = module_path_without_device_prefix(utf8);
   if (!p[0]) return false;
   const bool rooted = (p[0] && p[1] == ':') || p[0] == '\\' || p[0] == '/';
   if (rooted) {
@@ -3022,6 +3026,20 @@ bool eq_ci(const char* a, const char* b) {
   return *a == 0 && *b == 0;
 }
 
+bool can_use_system_module_for_path(const char* path) {
+  if (!path[0]) return false;
+  const char* name = module_path_without_device_prefix(path);
+  const char* base = path_basename(name);
+  if (!base[0] || strchr(base, ':')) return false;
+  if (base == name) return name == path;
+  constexpr char system_dir[] = "C:\\Windows\\System32\\";
+  if (base - name != sizeof(system_dir) - 1) return false;
+  char directory[sizeof(system_dir)]{};
+  for (size_t i = 0; i < sizeof(directory) - 1; ++i)
+    directory[i] = name[i] == '/' ? '\\' : name[i];
+  return eq_ci(directory, system_dir);
+}
+
 void* system_module_handle(const char* utf8_name) {
   if (!utf8_name || !utf8_name[0]) return nullptr;
   const char* base = path_basename(utf8_name);
@@ -3067,7 +3085,9 @@ static void* load_library_impl(const u16* path, u32 flags) {
   // Never load a guest-shipped steam_api64.dll / steam_api.dll; always route
   // Steamworks calls through Tiramisu's BUILTIN bridge (auth-only, zero DRM bypass).
   char utf8_in[1024];
-  if (trt_utf16_to_utf8(path, utf8_in, sizeof(utf8_in)) == 0) {
+  const bool have_path = trt_utf16_to_utf8(path, utf8_in, sizeof(utf8_in)) == 0;
+  const bool can_use_system = have_path && can_use_system_module_for_path(utf8_in);
+  if (have_path) {
     const char* b = path_basename(utf8_in);
     if (eq_ci(b, "steam_api64.dll") || eq_ci(b, "steam_api64") ||
         eq_ci(b, "steam_api.dll") || eq_ci(b, "steam_api")) {
@@ -3085,9 +3105,8 @@ static void* load_library_impl(const u16* path, u32 flags) {
   }
   char host[1024];
   if (!guest_path_to_host(path, host, sizeof(host))) {
-    char utf8[256];
-    if (trt_utf16_to_utf8(path, utf8, sizeof(utf8)) == 0) {
-      if (void* h = system_module_handle(utf8)) return h;
+    if (can_use_system) {
+      if (void* h = system_module_handle(utf8_in)) return h;
     }
     err_ref_for_current_thread() = 126;  // ERROR_MOD_NOT_FOUND
     return nullptr;
@@ -3101,9 +3120,8 @@ static void* load_library_impl(const u16* path, u32 flags) {
   const int run_entry = (flags & 0x23u) ? 0 : 1;
   trt_image* img = trt_load_pe(host, base, run_entry);
   if (!img) {
-    char utf8[256];
-    if (trt_utf16_to_utf8(path, utf8, sizeof(utf8)) == 0) {
-      if (void* h = system_module_handle(utf8)) return h;
+    if (can_use_system) {
+      if (void* h = system_module_handle(utf8_in)) return h;
     }
     err_ref_for_current_thread() = 126;  // MOD_NOT_FOUND
     return nullptr;

@@ -1,6 +1,7 @@
 // tiramisu/src/host/steam_client.cpp
 // Native Xbox UWP Steam Client + CM/CDN Depot Downloader.
 #include "steam_client.h"
+#include "steam_install.h"
 #include "host_log.h"
 #include "../trt/bridge_steam.h"
 #include "../trt/steam_auth.h"
@@ -1295,57 +1296,70 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
 
 void scan_installed_into_items(const std::string& games_dir,
                                std::vector<steam_library_item>* items) {
-  std::unordered_map<uint32_t, std::string> local_dirs;
+  struct local_entry {
+    std::string dir;
+    steam_local_install install;
+  };
+  std::unordered_map<uint32_t, local_entry> local_dirs;
   WIN32_FIND_DATAA fd{};
   HANDLE h = FindFirstFileA((games_dir + "\\*").c_str(), &fd);
   if (h != INVALID_HANDLE_VALUE) {
     do {
-      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-      if (fd.cFileName[0] == '.') continue;
-      std::string gdir = games_dir + "\\" + fd.cFileName;
-      if (GetFileAttributesA((gdir + kSteamInstallPending).c_str()) !=
-          INVALID_FILE_ATTRIBUTES) continue;
-      std::string appid_path = gdir + "\\steam_appid.txt";
-      FILE* f = fopen(appid_path.c_str(), "rb");
-      if (f) {
-        char buf[64] = {};
-        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-        fclose(f);
-        if (n > 0) {
-          uint32_t id = (uint32_t)strtoul(buf, nullptr, 10);
-          if (id > 0) local_dirs[id] = gdir;
-        }
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+      const std::string dir = games_dir + "\\" + fd.cFileName;
+      auto install = inspect_steam_install(dir);
+      if (!install.app_id) continue;
+      auto found = local_dirs.find(install.app_id);
+      if (found != local_dirs.end()) {
+        const bool ready = install.state == steam_install_state::ready;
+        const bool was_ready = found->second.install.state == steam_install_state::ready;
+        if (was_ready && !ready) continue;
+        if (was_ready == ready && found->second.dir <= dir) continue;
       }
+      local_dirs[install.app_id] = {dir, std::move(install)};
     } while (FindNextFileA(h, &fd));
     FindClose(h);
   }
 
+  auto assign_install = [](steam_library_item& item, const local_entry& entry) {
+    item.installed = entry.install.state == steam_install_state::ready;
+    item.install_dir = entry.dir;
+    if (item.downloading) return;
+    item.download_pct = item.installed ? 1.0f : 0.0f;
+    if (item.installed)
+      item.status_text = "Ready to Play";
+    else if (entry.install.state == steam_install_state::incomplete)
+      item.status_text = "Install incomplete. Select Install to retry.";
+    else
+      item.status_text = "Windows launch executable missing or invalid. Select Install to retry.";
+  };
   std::vector<uint32_t> owned_ids;
   for (auto& it : *items) {
     owned_ids.push_back(it.app_id);
-    auto found = local_dirs.find(it.app_id);
+    const auto found = local_dirs.find(it.app_id);
     if (found != local_dirs.end()) {
-      it.installed = true;
-      it.install_dir = found->second;
-      it.download_pct = 1.0f;
-      if (it.status_text.empty()) it.status_text = "Ready to Play";
+      assign_install(it, found->second);
       local_dirs.erase(found);
     } else if (!it.downloading) {
       it.installed = false;
+      it.install_dir.clear();
+      if (it.download_pct == 1.0f) {
+        it.download_pct = 0.0f;
+        it.status_text.clear();
+      }
     }
   }
-  // Include any side-loaded Steam titles already on disk
+  // List valid side-loaded Steam titles with their local launch path.
   for (const auto& kv : local_dirs) {
+    const auto& entry = kv.second;
+    if (entry.install.state != steam_install_state::ready) continue;
     owned_ids.push_back(kv.first);
     steam_library_item extra;
     extra.app_id = kv.first;
-    size_t sl = kv.second.rfind('\\');
-    extra.title = (sl == std::string::npos) ? kv.second : kv.second.substr(sl + 1);
+    const size_t sl = entry.dir.rfind('\\');
+    extra.title = sl == std::string::npos ? entry.dir : entry.dir.substr(sl + 1);
     extra.size_str = "Installed locally";
-    extra.installed = true;
-    extra.install_dir = kv.second;
-    extra.download_pct = 1.0f;
-    extra.status_text = "Ready to Play";
+    assign_install(extra, entry);
     items->push_back(std::move(extra));
   }
   trt_steam_set_owned_appids(owned_ids.data(), (int)owned_ids.size());

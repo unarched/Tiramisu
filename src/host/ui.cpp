@@ -2300,8 +2300,10 @@ void ui_log_scroll(int delta) {
 
 void ui_set_delete_confirm(int game_index) { g_delete_confirm_idx = game_index; }
 
-void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
+int32_t ui_init(unsigned width, unsigned height, void* d2d_factory_v,
              void* dwrite_factory_v, void* d2d_device_v, void* swapchain_v) {
+  if (!width || !height || !d2d_factory_v || !dwrite_factory_v ||
+      !d2d_device_v || !swapchain_v) return E_INVALIDARG;
   g_w = (float)width;
   g_h = (float)height;
   g_factory = (ID2D1Factory1*)d2d_factory_v;
@@ -2313,53 +2315,54 @@ void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
   if (g_d2d_device) g_d2d_device->AddRef();
   if (g_swap) g_swap->AddRef();
 
-  g_d2d_device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_ctx);
+  HRESULT hr = g_d2d_device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_ctx);
+  if (FAILED(hr)) {
+    ui_shutdown();
+    return hr;
+  }
+  auto create_brush = [&](D2D1_COLOR_F color, ID2D1SolidColorBrush** brush) {
+    if (SUCCEEDED(hr)) hr = g_ctx->CreateSolidColorBrush(color, brush);
+  };
 
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.0f), &g_br_white);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.875f, 0.812f, 0.788f, 1.0f), &g_br_accent);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.788f, 0.710f, 0.682f, 1.0f), &g_br_accent2);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.078f, 0.075f, 0.094f, 1.0f), &g_br_ink);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.895f, 0.885f, 0.905f, 1.0f), &g_br_sub);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.675f, 0.660f, 0.700f, 1.0f), &g_br_dim);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.110f, 0.118f, 0.149f, 0.86f), &g_br_glass);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.165f, 0.176f, 0.220f, 0.92f), &g_br_glass2);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.16f), &g_br_border);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.38f), &g_br_border_hi);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f), &g_br_pill_bg);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.62f), &g_br_shadow);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.208f, 0.780f, 0.349f, 1.0f), &g_br_xbox_a);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.898f, 0.282f, 0.302f, 1.0f), &g_br_xbox_b);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.169f, 0.541f, 1.000f, 1.0f), &g_br_xbox_x);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.961f, 0.718f, 0.000f, 1.0f), &g_br_xbox_y);
+  create_brush(D2D1::ColorF(1.000f, 1.000f, 1.000f, 1.0f), &g_br_white);
+  create_brush(D2D1::ColorF(0.875f, 0.812f, 0.788f, 1.0f), &g_br_accent);
+  create_brush(D2D1::ColorF(0.788f, 0.710f, 0.682f, 1.0f), &g_br_accent2);
+  create_brush(D2D1::ColorF(0.078f, 0.075f, 0.094f, 1.0f), &g_br_ink);
+  create_brush(D2D1::ColorF(0.895f, 0.885f, 0.905f, 1.0f), &g_br_sub);
+  create_brush(D2D1::ColorF(0.675f, 0.660f, 0.700f, 1.0f), &g_br_dim);
+  create_brush(D2D1::ColorF(0.110f, 0.118f, 0.149f, 0.86f), &g_br_glass);
+  create_brush(D2D1::ColorF(0.165f, 0.176f, 0.220f, 0.92f), &g_br_glass2);
+  create_brush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.16f), &g_br_border);
+  create_brush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.38f), &g_br_border_hi);
+  create_brush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f), &g_br_pill_bg);
+  create_brush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.62f), &g_br_shadow);
+  create_brush(D2D1::ColorF(0.208f, 0.780f, 0.349f, 1.0f), &g_br_xbox_a);
+  create_brush(D2D1::ColorF(0.898f, 0.282f, 0.302f, 1.0f), &g_br_xbox_b);
+  create_brush(D2D1::ColorF(0.169f, 0.541f, 1.000f, 1.0f), &g_br_xbox_x);
+  create_brush(D2D1::ColorF(0.961f, 0.718f, 0.000f, 1.0f), &g_br_xbox_y);
 
+  auto create_font = [&](DWRITE_FONT_WEIGHT weight, float size, IDWriteTextFormat** format) {
+    if (SUCCEEDED(hr))
+      hr = g_dw->CreateTextFormat(L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                                  DWRITE_FONT_STRETCH_NORMAL, size, L"en-US", format);
+  };
   const float fscale = std::min(g_w / 1440.0f, g_h / 810.0f);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         50.0f * fscale, L"en-US", &g_f_hero);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         36.0f * fscale, L"en-US", &g_f_hero_md);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         44.0f * fscale, L"en-US", &g_f_stat);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         24.0f * fscale, L"en-US", &g_f_h2);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         18.0f * fscale, L"en-US", &g_f_nav);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         16.5f * fscale, L"en-US", &g_f_body);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         14.0f * fscale, L"en-US", &g_f_small);
+  create_font(DWRITE_FONT_WEIGHT_BOLD, 50.0f * fscale, &g_f_hero);
+  create_font(DWRITE_FONT_WEIGHT_BOLD, 36.0f * fscale, &g_f_hero_md);
+  create_font(DWRITE_FONT_WEIGHT_BOLD, 44.0f * fscale, &g_f_stat);
+  create_font(DWRITE_FONT_WEIGHT_SEMI_BOLD, 24.0f * fscale, &g_f_h2);
+  create_font(DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.0f * fscale, &g_f_nav);
+  create_font(DWRITE_FONT_WEIGHT_NORMAL, 16.5f * fscale, &g_f_body);
+  create_font(DWRITE_FONT_WEIGHT_NORMAL, 14.0f * fscale, &g_f_small);
   g_dw->CreateTextFormat(L"Consolas", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
                          DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
                          13.5f * fscale, L"en-US", &g_f_mono);
-  g_dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_BOLD,
-                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                         12.5f * fscale, L"en-US", &g_f_btn);
+  create_font(DWRITE_FONT_WEIGHT_BOLD, 12.5f * fscale, &g_f_btn);
+
+  if (FAILED(hr)) {
+    ui_shutdown();
+    return hr;
+  }
 
   // Upload embedded Tiramisu mascot badge bitmap (avatar_bear.png)
   D2D1_BITMAP_PROPERTIES mp = D2D1::BitmapProperties(
@@ -2367,6 +2370,7 @@ void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
                         D2D1_ALPHA_MODE_PREMULTIPLIED));
   g_ctx->CreateBitmap(D2D1::SizeU(k_mascot_w, k_mascot_h), k_mascot_bgra,
                       k_mascot_w * 4, mp, &g_mascot_bmp);
+  return S_OK;
 }
 
 void ui_shutdown() {

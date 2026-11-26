@@ -145,6 +145,7 @@ void* fake_system_load(const char* module, const char* symbol) {
 extern "C" void* TRT_STDCALL trt_LoadLibraryW(const u16*);
 extern "C" void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
 extern "C" void* TRT_STDCALL trt_GetProcessHeap(void);
+extern "C" u32 TRT_STDCALL trt_GetLastError(void);
 extern "C" u32 TRT_STDCALL trt_GetModuleFileNameW(void*, u16*, u32);
 
 // NOTE: the arguments are read through MEMORY constraints and BEFORE %rsp
@@ -242,6 +243,17 @@ int main(int argc, char** argv) {
       dll_main_called_host = true;
   CHECK(dll_main_called_host, "DllMain reached the host with the right arguments");
   CHECK(g_fake_calls >= 3, "cross-image calls landed (DllMain + 2 exports)");
+
+  const void* kernel32 = trt_LoadLibraryW((const u16*)u"kernel32.dll");
+  CHECK(kernel32, "bare system DLL name reaches the built-in provider");
+  CHECK(trt_LoadLibraryW((const u16*)u"c:/WINDOWS/system32/kernel32") == kernel32,
+        "explicit system directory still reaches the built-in provider");
+  CHECK(!trt_LoadLibraryW((const u16*)u"C:\\missing\\kernel32.dll") &&
+            trt_GetLastError() == 126,
+        "missing explicit path does not silently select a system provider");
+  CHECK(!trt_LoadLibraryW((const u16*)u"missing\\kernel32.dll") &&
+            trt_GetLastError() == 126,
+        "missing relative DLL path does not silently select a system provider");
 
   if (argc > 4) {
     trt_vfs_mount("z:", argv[3]);

@@ -125,11 +125,18 @@ u32 g_sc_colorspace = 0;
 std::atomic<bool> g_sc_presented{false};
 
 // These counters describe the current launch and carry no game data.
+std::atomic<u32> g_output_mode_changes_logged{0};
 std::atomic<u32> g_d3d11_devices{0}, g_d3d11_swapchains{0}, g_d3d11_buffers{0};
 std::atomic<u32> g_d3d11_presents{0}, g_d3d11_visible_presents{0};
 std::atomic<int> g_d3d11_last_present{0};
 std::atomic<u32> g_d3d11_swap_effect{3}, g_d3d11_buffer_count{2};
 std::atomic<u32> g_d3d11_stable_backbuffer{0};
+std::atomic<u32> g_d3d11_sample_count{1}, g_d3d11_sample_quality{0};
+
+struct swapchain_sampling {
+  u32 count = 1;
+  u32 quality = 0;
+};
 u32 g_d3d11_guest_format = 0;
 std::atomic<u32> g_d3d11_width{0}, g_d3d11_height{0};
 void* g_d3d11_hwnd = nullptr;
@@ -144,7 +151,16 @@ void* desktop_swapchain_window(const u32* desc) {
 }
 
 int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
-                              u32 effect, void* hwnd, bool creating) {
+                              u32 effect, void* hwnd, bool creating,
+                              swapchain_sampling sampling = {}) {
+  if (!creating)
+    sampling = {g_d3d11_sample_count.load(), g_d3d11_sample_quality.load()};
+  if (!sampling.count) sampling.count = 1;
+  constexpr int invalid_call = static_cast<int>(0x887a0001u);
+  if ((sampling.count == 1 && sampling.quality) || sampling.count > 32 ||
+      (sampling.count > 1 && effect != 0 /* DXGI_SWAP_EFFECT_DISCARD */))
+    return invalid_call;
+  if (sampling.count > 1 && !g_hooks.configure_d3d11_swapchain) return TRT_E_NOTIMPL;
   const u32 requested_width = width, requested_height = height;
   i32 client_width = 0, client_height = 0;
   if (hwnd && (!width || !height))
@@ -161,7 +177,8 @@ int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
   }
   const u32 effective_count = count ? count : (creating ? 2 : g_d3d11_buffer_count.load());
   const int hr = g_hooks.configure_d3d11_swapchain
-      ? g_hooks.configure_d3d11_swapchain(width, height, fmt, effective_count, effect) : 0;
+      ? g_hooks.configure_d3d11_swapchain(width, height, fmt, effective_count, effect,
+                                        sampling.count, sampling.quality) : 0;
   if (!creating) {
     std::lock_guard<std::mutex> lock(g_resize_stats_mutex);
     ++g_resize_stats.buffer_calls;
@@ -177,6 +194,8 @@ int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
   g_d3d11_height.store(height);
   g_d3d11_hwnd = hwnd;
   if (fmt || creating) g_d3d11_guest_format = fmt;
+  g_d3d11_sample_count.store(sampling.count);
+  g_d3d11_sample_quality.store(sampling.quality);
   g_d3d11_swap_effect.store(effect);
   g_d3d11_buffer_count.store(effective_count);
   g_d3d11_stable_backbuffer.store(g_hooks.configure_d3d11_swapchain &&
@@ -184,13 +203,16 @@ int configure_guest_swapchain(u32 width, u32 height, u32 fmt, u32 count,
   return 0;
 }
 
-void describe_guest_backbuffer(u32* dimensions, u32* format, u32* count, u32* effect) {
+void describe_guest_backbuffer(u32* dimensions, u32* format, u32* count,
+                               u32* effect, u32* samples) {
   if (g_sc_is_d3d12) return;
   const u32 width = g_d3d11_width.load(), height = g_d3d11_height.load();
   if (width && height) {
     dimensions[0] = width;
     dimensions[1] = height;
   }
+  samples[0] = g_d3d11_sample_count.load();
+  samples[1] = g_d3d11_sample_quality.load();
   if (!g_d3d11_stable_backbuffer.load()) return;
   // Only replace formats the host can create without substituting another.
   switch (g_d3d11_guest_format) {
@@ -386,7 +408,7 @@ int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, void*);
     const int hr = ((fn_t)slot)(sc, desc);
     if (hr >= 0) {
-      describe_guest_backbuffer(d, &d[4], &d[10], &d[15]);
+      describe_guest_backbuffer(d, &d[4], &d[10], &d[15], &d[7]);
       if (!g_sc_is_d3d12 && g_d3d11_hwnd)
         memcpy(d + 12, &g_d3d11_hwnd, sizeof(g_d3d11_hwnd));
     }
@@ -402,11 +424,19 @@ int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
   d[9] = 0x20; // DXGI_USAGE_RENDER_TARGET_OUTPUT
   d[10] = g_sc_buf_count ? g_sc_buf_count : 2u;  // BufferCount
   d[14] = 1;   // Windowed = TRUE
-  describe_guest_backbuffer(d, &d[4], &d[10], &d[15]);
+  describe_guest_backbuffer(d, &d[4], &d[10], &d[15], &d[7]);
   if (!g_sc_is_d3d12 && g_d3d11_hwnd)
     memcpy(d + 12, &g_d3d11_hwnd, sizeof(g_d3d11_hwnd));
   return 0;
 }
+void update_d3d12_buffers(u32 count, u32 width, u32 height) {
+  if (!g_sc_is_d3d12) return;
+  if (count >= 2) g_sc_buf_count = count;
+  if (width) g_sc_width = width;
+  if (height) g_sc_height = height;
+  g_sc_backbuf_idx = 0;
+}
+
 int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32 fmt, u32 flags) {
   (void)self;
   if (!g_sc_is_d3d12 && g_hooks.configure_d3d11_swapchain)
@@ -414,27 +444,23 @@ int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32
                                      g_d3d11_hwnd, false);
   void* sc = active_sc();
   void* slot = real_sc_slot(13);
-  int hr = 0;
-  if (g_sc_is_d3d12) {
-    if (count >= 2) g_sc_buf_count = count;
-    if (w) g_sc_width = w;
-    if (h) g_sc_height = h;
-    g_sc_backbuf_idx = 0;
-  }
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32);
-    // Strip ALLOW_MODE_SWITCH (0x2) & ALLOW_TEARING (0x800) before host resize
-    hr = ((fn_t)slot)(sc, count, w, h, fmt, flags & ~0x802u);
+    // Mode switches and tearing cannot be requested of the CoreWindow chain.
+    const int hr = ((fn_t)slot)(sc, count, w, h, fmt, flags & ~0x802u);
+    if (hr >= 0) {
+      update_d3d12_buffers(count, w, h);
+    } else {
+      char line[128];
+      snprintf(line, sizeof(line), "trt: DXGI ResizeBuffers(%ux%u fmt=%u) rejected: 0x%08x",
+               w, h, fmt, static_cast<u32>(hr));
+      trt_core_log(line);
+    }
+    return hr;
   }
-  if (hr < 0) {
-    char line[160];
-    snprintf(line, sizeof(line),
-             "trt: IDXGISwapChain::ResizeBuffers(%ux%u fmt=%u) host hr=0x%08x -> "
-             "S_OK (CoreWindow fixed size)",
-             w, h, fmt, (u32)hr);
-    trt_core_log(line);
-  }
-  return 0;
+  if (!g_sc_is_d3d12 || sc) return TRT_E_NOTIMPL;
+  update_d3d12_buffers(count, w, h);
+  return 0;  // Software-only D3D12 backbuffer used by the offline harness.
 }
 int TRT_GUEST_ABI fake_sc_ResizeTarget(void*, const void* mode) {
   gap_trace_record("DXGI.ResizeTarget");
@@ -508,7 +534,7 @@ int TRT_GUEST_ABI fake_sc_GetDesc1(void* self, void* desc1) {
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, void*);
     const int hr = ((fn_t)slot)(sc, desc1);
-    if (hr >= 0) describe_guest_backbuffer(d, &d[2], &d[7], &d[9]);
+    if (hr >= 0) describe_guest_backbuffer(d, &d[2], &d[7], &d[9], &d[4]);
     return hr;
   }
   memset(d, 0, 48);
@@ -519,7 +545,7 @@ int TRT_GUEST_ABI fake_sc_GetDesc1(void* self, void* desc1) {
   d[6] = 0x20; // DXGI_USAGE_RENDER_TARGET_OUTPUT
   d[7] = g_sc_buf_count ? g_sc_buf_count : 2u;  // BufferCount
   d[9] = 3;    // DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
-  describe_guest_backbuffer(d, &d[2], &d[7], &d[9]);
+  describe_guest_backbuffer(d, &d[2], &d[7], &d[9], &d[4]);
   return 0;
 }
 int TRT_GUEST_ABI fake_sc_GetFullscreenDesc(void* self, void* fdesc) {
@@ -648,17 +674,13 @@ int TRT_GUEST_ABI fake_sc_ResizeBuffers1(void* self, u32 count, u32 w, u32 h,
     return fake_sc_ResizeBuffers(self, count, w, h, fmt, flags);
   void* sc = active_sc3();
   void* slot = real_sc_slot(39);
-  if (g_sc_is_d3d12) {
-    if (count >= 2) g_sc_buf_count = count;
-    if (w) g_sc_width = w;
-    if (h) g_sc_height = h;
-    g_sc_backbuf_idx = 0;
-  }
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32, const u32*, void* const*);
     const int hr = ((fn_t)slot)(sc, count, w, h, fmt, flags & ~0x802u, mask, queues);
-    if (hr >= 0) return hr;
+    if (hr >= 0) update_d3d12_buffers(count, w, h);
+    return hr;
   }
+  if (mask || queues) return TRT_E_NOTIMPL;
   return fake_sc_ResizeBuffers(self, count, w, h, fmt, flags);
 }
 int TRT_GUEST_ABI fake_sc_SetHDRMetaData(void*, u32 type, u32 size, const void* data) {
@@ -850,100 +872,84 @@ int TRT_GUEST_ABI out_get_desc(void*, void* pDesc) {
   return 0;
 }
 
-static u32 out_build_modes(u32 fmt, u32 widths[2], u32 heights[2]) {
-  u32 dw = 1920, dh = 1080;
-  out_active_dims(&dw, &dh);
-  widths[0] = dw;
-  heights[0] = dh;
-  if (dw != 1280 || dh != 720) {
-    widths[1] = 1280;
-    heights[1] = 720;
-    (void)fmt;
-    return 2;
-  }
-  widths[1] = 1920;
-  heights[1] = 1080;
-  return 2;
+struct output_resolution {
+  u32 width, height;
+};
+
+void out_build_modes(output_resolution (&modes)[2]) {
+  auto& current = modes[0];
+  out_active_dims(&current.width, &current.height);
+  modes[1] = current.width == 1280 && current.height == 720
+      ? output_resolution{1920, 1080} : output_resolution{1280, 720};
 }
 
-int TRT_GUEST_ABI out_get_modes(void*, u32 fmt, u32 flags, u32* pNum,
-                                void* pDesc) {
+void out_write_mode(u32* mode, output_resolution resolution, u32 format) {
+  mode[0] = resolution.width;
+  mode[1] = resolution.height;
+  mode[2] = 60;
+  mode[3] = 1;
+  mode[4] = format ? format : 28u;  // R8G8B8A8_UNORM
+  mode[5] = 0;  // Unspecified scanline ordering.
+  mode[6] = 0;  // Unspecified scaling.
+}
+
+int out_get_mode_list(u32 format, u32* count, void* dest, bool extended) {
+  if (!count) return TRT_E_INVALIDARG;
+  constexpr u32 total = 2;
+  output_resolution modes[total]{};
+  out_build_modes(modes);
+  const u32 cap = dest ? *count : 0;
+  *count = total;
+  if (!dest) return 0;
+
+  const u32 stride = extended ? 8 : 7;
+  for (u32 i = 0; i < cap && i < total; ++i) {
+    auto* mode = static_cast<u32*>(dest) + i * stride;
+    out_write_mode(mode, modes[i], format);
+    if (extended) mode[7] = 0;  // No stereo output.
+  }
+  return cap < total ? static_cast<int>(0x887A0003u) /* DXGI_ERROR_MORE_DATA */ : 0;
+}
+
+int TRT_GUEST_ABI out_get_modes(void*, u32 format, u32 flags, u32* count, void* dest) {
   (void)flags;
-  if (!pNum) return TRT_E_INVALIDARG;
-  u32 ws[2], hs[2];
-  const u32 total = out_build_modes(fmt, ws, hs);
-  if (!pDesc) {
-    *pNum = total;
-    return 0;
-  }
-  const u32 cap = *pNum;
-  const u32 n = cap < total ? cap : total;
-  const u32 use_fmt = fmt ? fmt : 28u;  // R8G8B8A8_UNORM
-  for (u32 i = 0; i < n; ++i) {
-    u32* m = (u32*)((u8*)pDesc + (size_t)i * 28);
-    m[0] = ws[i];
-    m[1] = hs[i];
-    m[2] = 60;
-    m[3] = 1;
-    m[4] = use_fmt;
-    m[5] = 0;
-    m[6] = 0;
-  }
-  *pNum = total;
-  return (cap < total) ? (int)0x887A0003u /*DXGI_ERROR_MORE_DATA*/ : 0;
+  return out_get_mode_list(format, count, dest, false);
 }
 
-int TRT_GUEST_ABI out_find_closest(void*, const void* match, void* closest,
-                                   void*) {
+int TRT_GUEST_ABI out_find_closest(void*, const void* match, void* closest, void*) {
   if (!match || !closest) return TRT_E_INVALIDARG;
-  memcpy(closest, match, 28);
-  u32* m = (u32*)closest;
-  u32 dw = 1920, dh = 1080;
-  out_active_dims(&dw, &dh);
-  if (m[0] == 0) m[0] = dw;
-  if (m[1] == 0) m[1] = dh;
-  if (m[2] == 0 || m[3] == 0) {
-    m[2] = 60;
-    m[3] = 1;
+  const auto* request = static_cast<const u32*>(match);
+  const u32 width = request[0], height = request[1], format = request[4];
+  if ((width == 0) != (height == 0)) return static_cast<int>(0x887A0001u);
+
+  output_resolution modes[2]{};
+  out_build_modes(modes);
+  auto distance = [&](output_resolution mode) -> u64 {
+    const u64 dw = mode.width > width ? mode.width - width : width - mode.width;
+    const u64 dh = mode.height > height ? mode.height - height : height - mode.height;
+    return dw + dh;
+  };
+  const auto best = width && distance(modes[1]) < distance(modes[0]) ? modes[1] : modes[0];
+  if (width && (width != best.width || height != best.height) &&
+      g_output_mode_changes_logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+    char line[128];
+    snprintf(line, sizeof(line), "trt: DXGI virtual output matched %ux%u to %ux%u",
+             width, height, best.width, best.height);
+    trt_core_log(line);
   }
-  if (m[4] == 0) m[4] = 28u;
+  out_write_mode(static_cast<u32*>(closest), best, format);
   return 0;
 }
 
-int TRT_GUEST_ABI out_get_modes1(void*, u32 fmt, u32 flags, u32* pNum,
-                                 void* pDesc1) {
+int TRT_GUEST_ABI out_get_modes1(void*, u32 format, u32 flags, u32* count, void* dest) {
   (void)flags;
-  if (!pNum) return TRT_E_INVALIDARG;
-  u32 ws[2], hs[2];
-  const u32 total = out_build_modes(fmt, ws, hs);
-  if (!pDesc1) {
-    *pNum = total;
-    return 0;
-  }
-  const u32 cap = *pNum;
-  const u32 n = cap < total ? cap : total;
-  const u32 use_fmt = fmt ? fmt : 28u;
-  for (u32 i = 0; i < n; ++i) {
-    u32* m = (u32*)((u8*)pDesc1 + (size_t)i * 32);
-    m[0] = ws[i];
-    m[1] = hs[i];
-    m[2] = 60;
-    m[3] = 1;
-    m[4] = use_fmt;
-    m[5] = 0;
-    m[6] = 0;
-    m[7] = 0;  // Stereo = FALSE
-  }
-  *pNum = total;
-  return (cap < total) ? (int)0x887A0003u : 0;
+  return out_get_mode_list(format, count, dest, true);
 }
 
-int TRT_GUEST_ABI out_find_closest1(void* self, const void* match,
-                                    void* closest, void* dev) {
+int TRT_GUEST_ABI out_find_closest1(void* self, const void* match, void* closest, void* dev) {
+  if (match && static_cast<const u32*>(match)[7]) return static_cast<int>(0x887A0002u);
   const int hr = out_find_closest(self, match, closest, dev);
-  if (hr == 0 && match && closest) {
-    ((u32*)closest)[7] = ((const u32*)match)[7];
-  }
+  if (hr == 0) static_cast<u32*>(closest)[7] = 0;
   return hr;
 }
 
@@ -1199,11 +1205,13 @@ int TRT_GUEST_ABI fake_GetPrivateData(void*, const void*, void*, u32*) { return 
 int TRT_GUEST_ABI fake_GetParent(void*, void**) { return TRT_E_NOTIMPL; }
 
 int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
-                          u32 swap_effect, void** swapchain, void* hwnd = nullptr) {
+                          u32 swap_effect, void** swapchain, void* hwnd,
+                          swapchain_sampling sampling) {
   if (!swapchain) return TRT_E_NOINTERFACE;
   *swapchain = nullptr;
   g_sc_presented.store(false);
   if (trt_d3d12_is_queue(device)) {
+    if (sampling.count > 1 || sampling.quality) return static_cast<int>(0x887a0001u);
     if (g_hooks.acquire_d3d12_swapchain) {
       void* sc12 = nullptr;
       const int hr = g_hooks.acquire_d3d12_swapchain(
@@ -1224,7 +1232,7 @@ int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
     return 0;
   }
   if (!g_hooks.swapchain) return TRT_E_NOTIMPL;
-  const int hr = configure_guest_swapchain(w, h, fmt, count, swap_effect, hwnd, true);
+  const int hr = configure_guest_swapchain(w, h, fmt, count, swap_effect, hwnd, true, sampling);
   if (hr < 0) return hr;
   g_sc_is_d3d12 = false;
   *swapchain = &g_swapchain_proxy_obj;
@@ -1268,7 +1276,8 @@ int TRT_GUEST_ABI fake_CreateSwapChain(void* self, void* device, void* desc,
            w, h, fmt, cnt, (void*)swapchain);
   trt_core_log(line);
   return create_swapchain_impl(device, w, h, fmt, cnt, d ? d[15] : 3,
-                               swapchain, desktop_swapchain_window(d));
+                               swapchain, desktop_swapchain_window(d),
+                               d ? swapchain_sampling{d[7], d[8]} : swapchain_sampling{});
 }
 int TRT_GUEST_ABI fake_CreateSoftwareAdapter(void*, void*, void**) { return TRT_E_NOTIMPL; }
 
@@ -1308,7 +1317,8 @@ int TRT_GUEST_ABI fake_CreateSwapChainForHwnd(void* self, void* device, void* hw
            "trt: CreateSwapChainForHwnd(%ux%u fmt=%u cnt=%u) -> out=%p",
            w, h, fmt, cnt, (void*)swapchain);
   trt_core_log(line);
-  return create_swapchain_impl(device, w, h, fmt, cnt, d ? d[9] : 3, swapchain, hwnd);
+  return create_swapchain_impl(device, w, h, fmt, cnt, d ? d[9] : 3, swapchain, hwnd,
+                               d ? swapchain_sampling{d[4], d[5]} : swapchain_sampling{});
 }
 int TRT_GUEST_ABI fake_CreateSwapChainForCoreWindow(void* self, void* device,
                                                    void* core_window, const void* desc,
@@ -1317,7 +1327,8 @@ int TRT_GUEST_ABI fake_CreateSwapChainForCoreWindow(void* self, void* device,
   (void)self; (void)core_window; (void)restrict_info;
   const u32* d = (const u32*)desc;
   return create_swapchain_impl(device, d ? d[0] : 0, d ? d[1] : 0,
-                               d ? d[2] : 87, d ? d[7] : 2, d ? d[9] : 3, swapchain);
+                               d ? d[2] : 87, d ? d[7] : 2, d ? d[9] : 3, swapchain, nullptr,
+                               d ? swapchain_sampling{d[4], d[5]} : swapchain_sampling{});
 }
 int TRT_GUEST_ABI fake_GetSharedResourceAdapterLuid(void*, void*, void*) { return TRT_E_NOTIMPL; }
 int TRT_GUEST_ABI fake_RegisterStereoStatusWindow(void*, u32, void*) { return TRT_E_NOTIMPL; }
@@ -1331,7 +1342,8 @@ int TRT_GUEST_ABI fake_CreateSwapChainForComposition(void* self, void* device, v
   (void)self; (void)restrict_info;
   const u32* d = (const u32*)desc;
   return create_swapchain_impl(device, d ? d[0] : 0, d ? d[1] : 0,
-                               d ? d[2] : 87, d ? d[7] : 2, d ? d[9] : 3, swapchain);
+                               d ? d[2] : 87, d ? d[7] : 2, d ? d[9] : 3, swapchain, nullptr,
+                               d ? swapchain_sampling{d[4], d[5]} : swapchain_sampling{});
 }
 
 // --- IDXGIFactory3 / IDXGIFactory4 / IDXGIFactory5 / IDXGIFactory6 ---------
@@ -1499,7 +1511,8 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u3
     const auto* desc = static_cast<const u32*>(swapchain_desc);
     const int result = create_swapchain_impl(g_hooks.device, desc ? desc[0] : 0,
         desc ? desc[1] : 0, desc ? desc[4] : 0, desc ? desc[10] : 0,
-        desc ? desc[15] : 3, out_swapchain, desktop_swapchain_window(desc));
+        desc ? desc[15] : 3, out_swapchain, desktop_swapchain_window(desc),
+        desc ? swapchain_sampling{desc[7], desc[8]} : swapchain_sampling{});
     if (result < 0) return result;
   }
 
@@ -1619,6 +1632,7 @@ u32 trt_gpu_count_lit_rgb32(const void* pixels, u32 width, u32 height, u32 row_p
 }
 
 void trt_gpu_reset_render_stats(void) {
+  g_output_mode_changes_logged.store(0, std::memory_order_relaxed);
   g_d3d11_devices.store(0, std::memory_order_relaxed);
   g_d3d11_swapchains.store(0, std::memory_order_relaxed);
   g_d3d11_buffers.store(0, std::memory_order_relaxed);
@@ -1628,6 +1642,8 @@ void trt_gpu_reset_render_stats(void) {
   g_d3d11_swap_effect.store(3, std::memory_order_relaxed);
   g_d3d11_buffer_count.store(2, std::memory_order_relaxed);
   g_d3d11_stable_backbuffer.store(0, std::memory_order_relaxed);
+  g_d3d11_sample_count.store(1, std::memory_order_relaxed);
+  g_d3d11_sample_quality.store(0, std::memory_order_relaxed);
   g_d3d11_guest_format = 0;
   g_d3d11_width.store(0);
   g_d3d11_height.store(0);
@@ -1653,6 +1669,8 @@ void trt_gpu_get_render_stats(trt_gpu_render_stats* stats) {
   stats->d3d11_swap_effect = g_d3d11_swap_effect.load(std::memory_order_relaxed);
   stats->d3d11_buffer_count = g_d3d11_buffer_count.load(std::memory_order_relaxed);
   stats->d3d11_stable_backbuffer = g_d3d11_stable_backbuffer.load(std::memory_order_relaxed);
+  stats->d3d11_sample_count = g_d3d11_sample_count.load(std::memory_order_relaxed);
+  stats->d3d11_sample_quality = g_d3d11_sample_quality.load(std::memory_order_relaxed);
   stats->d3d11_width = g_d3d11_width.load(std::memory_order_relaxed);
   stats->d3d11_height = g_d3d11_height.load(std::memory_order_relaxed);
 }

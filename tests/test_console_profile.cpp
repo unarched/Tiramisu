@@ -144,6 +144,18 @@ int main() {
           "unknown generation falls back to the full PC list");
   }
 
+  constexpr auto previous_runtime = static_cast<int32_t>(0x80070057u);
+  CHECK(retry_d3d11_without_11_1(previous_runtime, 0xb100u, 4),
+        "an older runtime can reject the 11_1 request and retry from 11_0");
+  CHECK(!retry_d3d11_without_11_1(0, 0xb100u, 4),
+        "a successful 11_1 request must keep the detected feature level");
+  CHECK(!retry_d3d11_without_11_1(previous_runtime, 0xb000u, 3),
+        "do not discard the original Xbox One's highest supported level");
+  CHECK(!retry_d3d11_without_11_1(previous_runtime, 0xb100u, 1),
+        "do not retry with an empty feature-level list");
+  CHECK(!retry_d3d11_without_11_1(static_cast<int32_t>(0x8007000eu), 0xb100u, 4),
+        "out of memory remains a visible device startup failure");
+
   // The environment override is the same path Device Portal tweaks use, and it
   // is what a desktop test can drive. First call wins (result is cached).
   setenv("TIRAMISU_CONSOLE_FAMILY", "one_x", 1);

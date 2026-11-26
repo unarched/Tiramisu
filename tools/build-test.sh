@@ -1063,7 +1063,7 @@ fi
 #         introspection, engine scoring, profile generation, Steam AppID
 #         auto-synthesis, adaptive thunk invocation, arity deduction ---
 clang++ -std=c++20 -O2 -Wall -no-pie \
-  tests/test_engine_synthesizer.cpp "$out/libtrt.a" -lpthread \
+  tests/test_engine_synthesizer.cpp src/host/steam_install.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_engine_synthesizer"
 "$out/test_engine_synthesizer"
 
